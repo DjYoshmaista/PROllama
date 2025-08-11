@@ -10,4 +10,5 @@ asyncpg>=0.27.0
 pgvector>=0.2.0
 tqdm>=4.64.0
 psutil>=5.9.0
-ollama>=
+python-dotenv
+ollama

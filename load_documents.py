@@ -2,7 +2,6 @@
 import gc
 import parse_documents
 from utils import get_embeddings_batch, EMBEDDING_DIMENSION
-from utils import cosine_similarity, euclidean_distance
 import os
 import json
 import logging
@@ -10,17 +9,13 @@ import inspect
 import asyncio
 
 logger = logging.getLogger()
-
-MAX_CONCURRENT_CHUNKS_PER_FILE = 8  # Increased concurrency per file
-MEMORY_CHUNK_SIZE = 100  # Larger batch size for embeddings
+MAX_CONCURRENT_CHUNKS_PER_FILE = 8
+MEMORY_CHUNK_SIZE = 100
 
 async def load_file(file_path, file_type, session):
-    """
-    Parses a file, gets embeddings, and returns data for insertion.
-    Maintains backward compatibility for single-file loading.
-    """
+    """Parses a file and returns data for insertion"""
     if os.path.getsize(file_path) == 0:
-        logger.info(f"{inspect.currentframe().f_lineno}:Skipping empty file: {file_path}")
+        logger.info(f"Skipping empty file: {file_path}")
         return []
     
     records = []
@@ -29,8 +24,7 @@ async def load_file(file_path, file_type, session):
     return records
 
 async def process_chunk(chunk, file_path, chunk_index, total_chunks, session):
-    """Process a single chunk of data including embedding generation"""
-    # Filter out empty content
+    """Process a single chunk of data"""
     valid_data = [
         item for item in chunk 
         if item["content"] and item["content"].strip()
@@ -39,28 +33,32 @@ async def process_chunk(chunk, file_path, chunk_index, total_chunks, session):
     if not valid_data:
         return []
         
-    # Prepare batch for embedding
     contents = [item["content"] for item in valid_data]
-    tags = [json.dumps(item.get("tags", [])) for item in valid_data]
+    tags_list = [item.get("tags", []) for item in valid_data]  # Keep as lists
     
-    # Get embeddings for batch
     embeddings = await get_embeddings_batch(session, contents)
     
-    # Prepare records with validation
     records = []
+    failed_count = 0
     for j, embedding in enumerate(embeddings):
         if embedding is None:
+            failed_count += 1
             continue
             
-        # Validate embedding dimensions
         if len(embedding) != EMBEDDING_DIMENSION:
+            failed_count += 1
             continue
         
+        # Return tags as list, not JSON string
         records.append((
-            contents[j],       # content
-            tags[j],           # tags
-            embedding          # embedding vector
+            contents[j],      # content
+            tags_list[j],     # tags as list (JSONB will handle it)
+            embedding         # embedding
         ))
+    
+    if failed_count > 0:
+        logger.warning(f"Failed to generate {failed_count}/{len(contents)} "
+                      f"embeddings in chunk {chunk_index} of {file_path}")
     
     return records
 
@@ -73,36 +71,60 @@ async def load_file_chunked(file_path, file_type, session, chunk_size=MEMORY_CHU
         yield records
 
 async def streaming_parse_file(file_path, file_type, session, chunk_size):
-    """Streaming parser for large files"""
+    """Streaming parser for large files - properly handle sync generators"""
+    
     if file_type == "csv":
-        # Use regular for with synchronous generator
+        # Use regular for loop with synchronous generator
         for chunk in parse_documents.stream_parse_csv(file_path, chunk_size):
             records = await process_chunk(chunk, file_path, 0, 0, session)
             if records:
                 yield records
+                
     elif file_type == "json":
-        # Use regular for with synchronous generator
+        # Use regular for loop with synchronous generator
         for chunk in parse_documents.stream_parse_json(file_path, chunk_size):
             records = await process_chunk(chunk, file_path, 0, 0, session)
             if records:
                 yield records
-    else:  # txt files
-        with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
-            while True:
-                content = f.read(8192)
-                if not content:
-                    break
-                chunk = [{"content": content, "tags": []}]
-                records = await process_chunk(chunk, file_path, 0, 0, session)
-                if records:
-                    yield records
+                
+    elif file_type == "py":
+        # Use regular for loop with synchronous generator
+        for chunk in parse_documents.stream_parse_py(file_path, chunk_size):
+            records = await process_chunk(chunk, file_path, 0, 0, session)
+            if records:
+                yield records
+                
+    else:  # txt files or fallback
+        # For text files, read in chunks directly
+        try:
+            with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
+                while True:
+                    content = f.read(8192)
+                    if not content:
+                        break
+                    chunk = [{"content": content, "tags": [file_type, file_path]}]
+                    records = await process_chunk(chunk, file_path, 0, 0, session)
+                    if records:
+                        yield records
+        except Exception as e:
+            logger.error(f"Error streaming {file_path}: {e}")
+            # Fallback: try to read entire file
+            try:
+                with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
+                    content = f.read(1000000)  # Limit to 1MB
+                    chunk = [{"content": content, "tags": ["fallback", file_path]}]
+                    records = await process_chunk(chunk, file_path, 0, 0, session)
+                    if records:
+                        yield records
+            except Exception as fallback_e:
+                logger.error(f"Fallback also failed for {file_path}: {fallback_e}")
 
 def load_folder(folder_path):
     for root, _, files in os.walk(folder_path):
         for file in files:
             file_path = os.path.join(root, file)
             file_type = os.path.splitext(file_path)[1][1:].lower()
-            if file_type in ["txt", "csv", "json"]:
+            if file_type in ["txt", "csv", "json", "py"]:
                 print(f"{inspect.currentframe().f_lineno}:Processing file: {file_path}")
                 if os.path.getsize(file_path) == 0:
                     print(f"{inspect.currentframe().f_lineno}:Skipping empty file: {file_path}")

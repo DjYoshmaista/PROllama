@@ -2,173 +2,176 @@
 import json
 import csv
 import os
-import re
+import ast
 import logging
 import ijson  # For streaming JSON parsing
 
 logger = logging.getLogger()
 MAX_CHUNK_SIZE = 1000  # Maximum records per chunk for streaming
 
-def parse_file(file_path, file_type):
-    try:
-        if not os.path.exists(file_path):
-            return []
-        if os.path.getsize(file_path) == 0:
-            return []
-        
-        if file_type == 'txt':
-            return parse_txt(file_path)
-        elif file_type == 'csv':
-            return safe_parse_csv(file_path)
-        elif file_type == 'json':
-            return parse_json(file_path)
+# --- Wrapper function ---
+def stream_parse_file(file_path, default_type=None, chunk_size=100):
+    """
+    Unified streaming parser wrapper.
+    Determines file type, prompts for default if needed/selected,
+    and calls the appropriate stream_parse_* function.
+    """
+    if not os.path.exists(file_path) or os.path.getsize(file_path) == 0:
+        logger.warning(f"File is missing or empty: {file_path}")
+        return # Yield nothing
+
+    # Determine file type from extension
+    _, ext = os.path.splitext(file_path)
+    file_type = ext[1:].lower() if ext else None # Remove the leading dot
+
+    # If type cannot be determined or user wants to override
+    if not file_type or file_type not in ['txt', 'csv', 'json', 'py']:
+        if default_type and default_type in ['txt', 'csv', 'json', 'py']:
+            logger.info(f"Using default type '{default_type}' for {file_path}")
+            file_type = default_type
         else:
-            return []
-    except Exception as e:
-        logger.error(f"Parse error ({file_path}): {e}")
-        return []
+            # Could prompt user here, but for streaming/bulk, a programmatic default or skip might be better
+            # For now, we'll log and skip unknown types, or treat as text as a fallback
+            logger.warning(f"Unknown or unsupported file type '{file_type}' for {file_path}. Treating as 'txt'.")
+            file_type = 'txt' # Default fallback
 
-def parse_txt(file_path):
-    with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
-        content = f.read(1000000)  # Limit to 1MB
-    return [{"content": content, "tags": []}]
-
-def safe_parse_csv(file_path):
-    """Robust CSV parsing with multiple fallback strategies"""
+    # Dispatch to the correct parser
     try:
-        # Attempt 1: Standard CSV parsing
-        with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
-            # Skip problematic characters
-            sample = f.read(10240).replace('\0', '')
-            f.seek(0)
-            
-            # Try to detect dialect
-            try:
-                sniffer = csv.Sniffer()
-                dialect = sniffer.sniff(sample)
-                has_header = sniffer.has_header(sample)
-            except:
-                dialect = 'excel'
-                has_header = False
-                
-            reader = csv.reader(f, dialect)
-            headers = []
-            if has_header:
-                try:
-                    headers = next(reader)
-                except:
-                    headers = []
-            
-            data = []
-            for i, row in enumerate(reader):
-                try:
-                    # Clean and convert all values to strings
-                    cleaned_row = [
-                        str(cell).strip() if cell is not None else ""
-                        for cell in row
-                    ]
-                    content = " ".join(cleaned_row)
-                    data.append({
-                        "content": content,
-                        "tags": headers.copy()
-                    })
-                except Exception as e:
-                    logger.warning(f"Row {i} error in {file_path}: {str(e)}")
-            return data
+        if file_type == 'txt':
+            yield from stream_parse_txt(file_path, chunk_size)
+        elif file_type == 'csv':
+            yield from stream_parse_csv(file_path, chunk_size)
+        elif file_type == 'json':
+            yield from stream_parse_json(file_path, chunk_size)
+        elif file_type == 'py':
+            yield from stream_parse_py(file_path, chunk_size)
+        else:
+            # This should ideally not be reached due to the check above, but as a safeguard
+            logger.error(f"No parser available for type '{file_type}' (file: {file_path})")
+            # Fallback to text parsing
+            yield from stream_parse_txt(file_path, chunk_size)
     except Exception as e:
-        logger.warning(f"CSV parse failed for {file_path}: {str(e)}")
-        # Final fallback: Treat as text
-        with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
-            content = f.read(1000000)
-            return [{"content": content, "tags": ["csv_fallback"]}]
-
-def parse_json(file_path):
-    with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
+        logger.error(f"Error during streaming parse of {file_path} ({file_type}): {e}", exc_info=True)
+        # Final fallback: yield the file content as a single text chunk
         try:
-            data = json.load(f)
-        except json.JSONDecodeError:
-            return []
-    
-    if isinstance(data, list):
-        result = []
-        for item in data:
-            if isinstance(item, dict):
-                content = json.dumps(item, ensure_ascii=False)
-                tags = [str(k) for k in item.keys()]
-            else:
-                content = str(item)
-                tags = []
-            result.append({"content": content, "tags": tags})
-        return result
-    elif isinstance(data, dict):
-        content = json.dumps(data, ensure_ascii=False)
-        tags = [str(k) for k in data.keys()]
-        return [{"content": content, "tags": tags}]
-    else:
-        return [{"content": str(data), "tags": []}]
+            with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
+                content = f.read(1000000) # Limit size
+            yield [{"content": content, "tags": [f"{file_type}_fallback", file_path]}]
+        except Exception as fallback_e:
+            logger.error(f"Fallback text read also failed for {file_path}: {fallback_e}")
+            yield [{"content": f"Failed to parse or read file: {file_path}", "tags": ["parse_error", file_path]}]
 
 def stream_parse_csv(file_path, chunk_size=100):
-    """Streaming CSV parser with generators"""
+    """Streaming CSV parser with generators.
+       Stores each row as a JSON object string to preserve structure.
+       Tags include the original headers/column names for that file.
+    """
     try:
         with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
-            # Skip problematic characters
             sample = f.read(10240).replace('\0', '')
             f.seek(0)
-            
-            # Try to detect dialect
             try:
                 sniffer = csv.Sniffer()
                 dialect = sniffer.sniff(sample)
                 has_header = sniffer.has_header(sample)
-            except:
+            except Exception as sniff_e:
+                logger.debug(f"CSV sniffing failed for {file_path}, using default 'excel': {sniff_e}")
                 dialect = 'excel'
                 has_header = False
-                
+
             reader = csv.reader(f, dialect)
-            headers = []
+            raw_headers = []
             if has_header:
                 try:
-                    headers = next(reader)
-                except:
-                    headers = []
-            
+                    raw_headers = next(reader)
+                except Exception as header_e:
+                    logger.warning(f"Error reading CSV header in {file_path}: {header_e}")
+                    raw_headers = []
+
+            # Process headers: clean and ensure uniqueness
+            processed_headers = []
+            if raw_headers:
+                seen = set()
+                for h in raw_headers:
+                    clean_h = str(h).strip() if h is not None else ""
+                    original_h = clean_h
+                    counter = 1
+                    while clean_h in seen:
+                        clean_h = f"{original_h}_{counter}"
+                        counter += 1
+                    seen.add(clean_h)
+                    processed_headers.append(clean_h)
+            else:
+                # Determine number of columns from the first data row
+                # Need to peek or handle carefully
+                # Let's read the first data line to get column count
+                try:
+                    # Use a temporary reader to peek
+                    f_temp = open(file_path, 'r', encoding='utf-8', errors='replace')
+                    temp_reader = csv.reader(f_temp, dialect)
+                    if has_header:
+                        next(temp_reader, None)
+                    first_data_row = next(temp_reader, None)
+                    f_temp.close()
+                    if first_data_row is not None:
+                        num_cols = len(first_data_row)
+                    else:
+                        num_cols = 0
+                except Exception as peek_e:
+                    logger.warning(f"Error peeking for CSV column count in {file_path}: {peek_e}")
+                    num_cols = 0
+                processed_headers = [f"column_{i}" for i in range(num_cols)]
+                # Reset main reader state
+                f.seek(0)
+                reader = csv.reader(f, dialect)
+                if has_header:
+                    next(reader, None) # Skip header again
+
             current_chunk = []
+            # Tags for all rows from this file will be the processed headers + file path
+            base_tags = processed_headers + [file_path]
+
             for i, row in enumerate(reader):
                 try:
-                    cleaned_row = [
-                        str(cell).strip() if cell is not None else ""
-                        for cell in row
-                    ]
-                    content = " ".join(cleaned_row)
+                    cleaned_values = [str(cell).strip() if cell is not None else "" for cell in row]
+                    row_dict = {}
+                    for j, value in enumerate(cleaned_values):
+                        if j < len(processed_headers):
+                            key = processed_headers[j]
+                        else:
+                            key = f"extra_col_{j}"
+                        row_dict[key] = value
+
+                    content = json.dumps(row_dict, ensure_ascii=False)
                     current_chunk.append({
                         "content": content,
-                        "tags": headers.copy()
+                        "tags": base_tags.copy() # Include processed headers as tags
                     })
-                    
+
                     if len(current_chunk) >= chunk_size:
                         yield current_chunk
                         current_chunk = []
                 except Exception as e:
                     logger.warning(f"Row {i} error in {file_path}: {str(e)}")
-            
+
             if current_chunk:
                 yield current_chunk
     except Exception as e:
-        logger.warning(f"CSV parse failed for {file_path}: {str(e)}")
-        # Fallback to text
+        logger.warning(f"CSV stream parse failed for {file_path}: {str(e)}")
         with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
-            while True:
-                content = f.read(8192)
-                if not content:
-                    break
-                yield [{"content": content, "tags": ["csv_fallback"]}]
+            content = f.read(1000000)
+            yield [{"content": content, "tags": ["csv_fallback_text_streaming", file_path]}]
 
 def stream_parse_json(file_path, chunk_size=100):
-    """Streaming JSON parser with generators"""
+    """Streaming JSON parser with generators.
+       Parses structure, captures hierarchy, and yields chunks of elements.
+       Tags include top-level keys for objects.
+    """
     try:
         with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
-            # Handle JSON arrays
-            if f.read(1) == '[':
+            # Handle JSON arrays using ijson for streaming
+            first_char = f.read(1)
+            if first_char == '[':
                 f.seek(0)
                 parser = ijson.parse(f)
                 current_chunk = []
@@ -176,7 +179,8 @@ def stream_parse_json(file_path, chunk_size=100):
                 object_depth = 0
                 in_object = False
                 key = None
-                
+                # Base tags for items in this file
+                base_tags = [file_path]
                 for prefix, event, value in parser:
                     if event == 'start_map':
                         if object_depth == 0:
@@ -186,47 +190,521 @@ def stream_parse_json(file_path, chunk_size=100):
                     elif event == 'end_map':
                         object_depth -= 1
                         if object_depth == 0 and in_object:
+                            # Content is the serialized object
                             content = json.dumps(current_object, ensure_ascii=False)
-                            tags = list(current_object.keys())
+                            # Tags are file path + object's top-level keys
+                            tags = base_tags.copy() + [str(k) for k in current_object.keys()]
                             current_chunk.append({"content": content, "tags": tags})
                             in_object = False
-                            
                             if len(current_chunk) >= chunk_size:
                                 yield current_chunk
                                 current_chunk = []
                     elif in_object and event == 'map_key':
                         key = value
-                    elif in_object and event in ['string', 'number', 'boolean']:
-                        current_object[key] = value
-                
+                    elif in_object and event in ['string', 'number', 'boolean', 'null']: # Handle null
+                         # ijson might represent null as None
+                         current_object[key] = value
+                    # Handle nested arrays/objects? ijson handles nesting,
+                    # but this simple logic captures top-level object keys only.
+                    # For items within arrays or nested objects, keys won't be top-level tags here.
                 if current_chunk:
                     yield current_chunk
             else:
-                # Single JSON object
+                # Single JSON object or scalar
                 f.seek(0)
                 data = json.load(f)
+                # Reuse logic from non-streaming parse_json, but yield in chunks
+                base_tags = [file_path]
+                records_to_yield = []
                 if isinstance(data, list):
-                    for i in range(0, len(data), chunk_size):
-                        chunk = data[i:i+chunk_size]
-                        records = []
-                        for item in chunk:
+                    for item in data:
+                        try:
+                            content = json.dumps(item, ensure_ascii=False)
+                            item_tags = base_tags.copy()
                             if isinstance(item, dict):
-                                content = json.dumps(item, ensure_ascii=False)
-                                tags = list(item.keys())
-                            else:
-                                content = str(item)
-                                tags = []
-                            records.append({"content": content, "tags": tags})
-                        yield records
+                                item_tags.extend([str(k) for k in item.keys()])
+                            # elif isinstance(item, (list, str, int, float, bool)) or item is None:
+                            #     item_tags.append(type(item).__name__)
+                            records_to_yield.append({"content": content, "tags": item_tags})
+                        except Exception as item_e:
+                            logger.warning(f"Error serializing item in JSON array {file_path}: {item_e}")
+
+                    # Yield records in chunks
+                    for i in range(0, len(records_to_yield), chunk_size):
+                         yield records_to_yield[i:i + chunk_size]
+
                 elif isinstance(data, dict):
                     content = json.dumps(data, ensure_ascii=False)
-                    tags = list(data.keys())
+                    tags = base_tags.copy() + [str(k) for k in data.keys()]
                     yield [{"content": content, "tags": tags}]
-                else:
-                    yield [{"content": str(data), "tags": []}]
+                else: # Scalar
+                    content = json.dumps(data, ensure_ascii=False)
+                    # tags = base_tags.copy() + [type(data).__name__]
+                    tags = base_tags.copy()
+                    yield [{"content": content, "tags": tags}]
     except Exception as e:
-        logger.warning(f"JSON parse failed for {file_path}: {str(e)}")
+        logger.warning(f"JSON stream parse failed for {file_path}: {str(e)}")
         # Fallback: treat as text
         with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
             content = f.read(1000000)
-            yield [{"content": content, "tags": []}]
+            yield [{"content": content, "tags": [file_path, "json_fallback_text"]}]
+
+def stream_parse_py(file_path, chunk_size=100):
+    """
+    Streaming Python (.py) file parser using AST.
+    Parses structure, captures hierarchy, and yields chunks of elements.
+    Each element includes its parent path for tracing.
+    """
+    try:
+        with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
+            source_code = f.read()
+
+        # Get the relative path for context
+        # You might want to pass the base directory if needed for absolute pathing
+        # relative_path = os.path.relpath(file_path, start=some_base_directory)
+        file_context = {
+            "file_path": file_path, # Or relative_path
+            "file_name": os.path.basename(file_path)
+        }
+
+        tree = ast.parse(source_code, filename=file_path)
+
+        current_chunk = []
+        # Stack to keep track of the current nesting (e.g., ['ClassName', 'method_name'])
+        parent_stack = []
+
+        def get_source_segment(node):
+            """Get the source code segment for a node."""
+            try:
+                # This requires the source code and line numbers to be available
+                # It's a bit tricky with just the AST node, but we can try
+                # A more robust way is to use ast.get_source_segment if available (Python 3.8+)
+                # For older versions, we can approximate or just use node type/name
+                if hasattr(ast, 'get_source_segment'):
+                    return ast.get_source_segment(source_code, node)
+                else:
+                    # Fallback: reconstruct or use basic info
+                    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                        # Approximate: function/class signature line
+                        lines = source_code.splitlines()
+                        if 1 <= node.lineno <= len(lines):
+                            # Get the line and maybe one more for multi-line signatures?
+                            # This is simplistic.
+                            sig_line = lines[node.lineno - 1] # lineno is 1-based
+                            # Try to capture basic indentation
+                            indent = ""
+                            if sig_line.startswith((' ', '\t')):
+                                 # Find the first non-whitespace character
+                                 for char in sig_line:
+                                     if char in (' ', '\t'):
+                                         indent += char
+                                     else:
+                                         break
+                            return f"{indent}# ... (code for {node.name}) ..."
+                    return f"# Source segment for {type(node).__name__} not available"
+            except Exception as e:
+                logger.debug(f"Could not get source segment for node in {file_path}: {e}")
+                return f"# Error getting source segment: {e}"
+
+        def get_indentation(node, source_lines):
+            """Determine the indentation string for a node."""
+            try:
+                if 1 <= node.lineno <= len(source_lines):
+                    line = source_lines[node.lineno - 1]
+                    indent = ""
+                    for char in line:
+                        if char in (' ', '\t'):
+                            indent += char
+                        else:
+                            break
+                    return indent
+                return ""
+            except:
+                 return ""
+
+        def process_node(node):
+            """Recursively process AST nodes."""
+            nonlocal current_chunk
+
+            element_info = None
+            source_segment = get_source_segment(node)
+            source_lines = source_code.splitlines() # For indentation
+
+            if isinstance(node, ast.Module):
+                # The module itself represents the file
+                element_info = {
+                    "type": "module",
+                    "name": "__main__", # Or file_context['file_name']?
+                    "full_name": file_context['file_path'],
+                    "parent_path": [], # Module is the root
+                    "source_segment": source_segment, # Might be the whole file or a summary
+                    "line_number": 1,
+                    "indentation": "", # Module level
+                    "docstring": ast.get_docstring(node) if hasattr(ast, 'get_docstring') else None
+                }
+                parent_stack.append("__main__") # Push module name
+
+            elif isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+                element_type = "class" if isinstance(node, ast.ClassDef) else ("async_function" if isinstance(node, ast.AsyncFunctionDef) else "function")
+                element_name = node.name
+
+                # Determine indentation
+                indent_str = get_indentation(node, source_lines)
+
+                element_info = {
+                    "type": element_type,
+                    "name": element_name,
+                    "full_name": ".".join(parent_stack + [element_name]), # e.g., module.ClassName.method
+                    "parent_path": list(parent_stack), # Copy the current stack
+                    "source_segment": source_segment,
+                    "line_number": getattr(node, 'lineno', -1),
+                    "indentation": indent_str, # Store indentation string
+                    "docstring": ast.get_docstring(node) if hasattr(ast, 'get_docstring') else None
+                }
+
+                # Add to chunk
+                current_chunk.append({
+                    "content": json.dumps(element_info, ensure_ascii=False), # Store structured data
+                    "tags": [element_type, file_context['file_path']] # Tag with type and file
+                })
+
+                # Check if chunk is full and yield
+                if len(current_chunk) >= chunk_size:
+                    yield current_chunk
+                    current_chunk = []
+
+                # Manage parent stack for nested elements
+                parent_stack.append(element_name)
+                # Process children (methods inside class, nested functions etc.)
+                for child_node in ast.iter_child_nodes(node):
+                     # Only process relevant child nodes that might be definitions
+                     # We primarily care about nested classes/functions
+                     if isinstance(child_node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                         yield from process_node(child_node) # Recurse and yield from sub-results
+                parent_stack.pop() # Pop after processing children
+
+            # Add logic for other important nodes if needed (e.g., imports for context)
+            elif isinstance(node, (ast.Import, ast.ImportFrom)):
+                 # Example: Capture imports for context
+                 import_info = {
+                     "type": "import",
+                     "names": [], # List of imported names/as names
+                     "parent_path": list(parent_stack),
+                     "line_number": getattr(node, 'lineno', -1),
+                     "source_segment": source_segment
+                 }
+                 if isinstance(node, ast.Import):
+                     for alias in node.names:
+                         import_info["names"].append({
+                             "name": alias.name,
+                             "asname": alias.asname
+                         })
+                 elif isinstance(node, ast.ImportFrom):
+                     import_info["module"] = node.module
+                     for alias in node.names:
+                         import_info["names"].append({
+                             "name": alias.name,
+                             "asname": alias.asname
+                         })
+                 # Add import info to chunk if desired
+                 current_chunk.append({
+                     "content": json.dumps(import_info, ensure_ascii=False),
+                     "tags": ["import", file_context['file_path']]
+                 })
+                 if len(current_chunk) >= chunk_size:
+                     yield current_chunk
+                     current_chunk = []
+
+        # Start processing from the root (Module)
+        # Add the module info first
+        # Note: The recursive process_node for Module will add it and manage the stack
+        yield from process_node(tree) # Start the recursive processing
+
+        # Yield any remaining items in the current chunk after traversal
+        if current_chunk:
+            yield current_chunk
+
+    except SyntaxError as se:
+        logger.warning(f"Python syntax error in {file_path}: {se}")
+        # Fallback: Treat as text
+        with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
+             content = f.read(1000000) # Limit size
+             yield [{"content": content, "tags": ["py_syntax_error", file_path]}]
+    except FileNotFoundError:
+        logger.warning(f"Python file not found: {file_path}")
+        yield [{"content": f"File not found: {file_path}", "tags": ["py_file_not_found", file_path]}]
+    except Exception as e:
+        logger.warning(f"Python parse failed for {file_path}: {str(e)}", exc_info=True)
+        # Fallback: treat as text
+        with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
+            content = f.read(1000000) # Limit size
+            yield [{"content": content, "tags": ["py_parse_fallback", file_path]}]
+
+def parse_json(file_path):
+    """Parse JSON file, storing each top-level item as a separate document.
+    Preserves structure by storing items as JSON strings.
+    """
+    try:
+        with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
+           raw_data = f.read()
+           if not raw_data.strip(): # Handle empty files
+               logger.info(f"JSON file is empty: {file_path}")
+               return []
+           data = json.loads(raw_data)
+    except json.JSONDecodeError as je:
+        logger.error(f"JSON decode error in {file_path}: {je}")
+        return []
+    except Exception as e:
+        logger.error(f"Error reading JSON file {file_path}: {e}")
+        return []
+
+    result = []
+    base_tags = ["structured_json", file_path]
+
+    if isinstance(data, list):
+        # Handle JSON array: Each item becomes a document
+        for i, item in enumerate(data):
+            try:
+                # Store the item itself as a JSON string
+                content = json.dumps(item, ensure_ascii=False)
+                # Tags can include the index or type of item
+                item_tags = base_tags.copy()
+                if isinstance(item, dict):
+                    # Add top-level keys of the item as tags
+                    item_tags.extend(list(item.keys())[:20])
+                elif isinstance(item, (list, str, int, float, bool)) or item is None:
+                    # Scalar or array item
+                    item_tags.append(type(item).__name__)
+                    pass # Keep tags simple
+                result.append({"content": content, "tags": item_tags})
+            except Exception as item_e:
+                logger.warning(f"Error serializing item {i} in JSON array {file_path}: {item_e}")
+                # result.append({"content": f"Error serializing item {i}: {item_e}", "tags": item_tags + ["error"]})
+
+    elif isinstance(data, dict):
+        # Handle single JSON object: The whole object is one document
+        try:
+            content = json.dumps(data, ensure_ascii=False)
+            # Tags can include top-level keys of the object
+            object_tags = base_tags.copy() # + list(data.keys())[:10] # Example: limit tags
+            result.append({"content": content, "tags": base_tags.copy()}) # Keep tags simple
+        except Exception as obj_e:
+            logger.error(f"Error serializing JSON object {file_path}: {obj_e}")
+            # result.append({"content": f"Error serializing object: {obj_e}", "tags": base_tags.copy() + ["error"]})
+    else:
+        # Handle scalar JSON values (number, string, boolean, null)
+        try:
+            content = json.dumps(data, ensure_ascii=False)
+            result.append({"content": content, "tags": base_tags.copy()}) # Keep tags simple
+        except Exception as scalar_e:
+            logger.error(f"Error serializing JSON scalar {file_path}: {scalar_e}")
+            # result.append({"content": f"Error serializing scalar: {scalar_e}", "tags": base_tags.copy() + ["error"]})
+
+    # Consider adding metadata about the JSON structure? Optional.
+    # e.g., if it was an array, its length, etc.
+    metadata_content = json.dumps({"type": "json_summary", "structure": type(data).__name__, "file": file_path}, ensure_ascii=False)
+    result.insert(0, {"content": metadata_content, "tags": base_tags.copy() + ["metadata"]})
+
+    return result
+
+def parse_file(file_path, file_type):
+    """Legacy function for non-streaming parsing. Returns all data at once."""
+    try:
+        if not os.path.exists(file_path):
+            return []
+        if os.path.getsize(file_path) == 0:
+            return []
+        # Delegate to stream parser and flatten the first chunk
+        parser = stream_parse_file(file_path, default_type=file_type, chunk_size=MAX_CHUNK_SIZE)
+        first_chunk = next(parser, [])
+        # If there are more chunks, concatenate them (though this breaks streaming benefit)
+        # For full compatibility, we might need to consume the entire generator
+        all_data = list(first_chunk)
+        try:
+            while True:
+                next_chunk = next(parser)
+                all_data.extend(next_chunk)
+        except StopIteration:
+            pass
+        return all_data
+    except Exception as e:
+        logger.error(f"Parse error ({file_path}): {e}")
+        return []
+
+def parse_txt(file_path):
+    with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
+        content = f.read(100000000)  # Limit to 100MB
+    return [{"content": content, "tags": []}]
+
+def safe_parse_csv(file_path):
+    """Robust CSV parsing with multiple fallback strategies.
+       Stores each row as a JSON object string to preserve structure.
+       Tags include the original headers/column names for that file.
+    """
+    try:
+        with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
+            # Skip problematic characters
+            sample = f.read(10240).replace('\0', '')
+            f.seek(0)
+            # Try to detect dialect
+            try:
+                sniffer = csv.Sniffer()
+                dialect = sniffer.sniff(sample)
+                has_header = sniffer.has_header(sample)
+            except Exception as sniff_e:
+                logger.debug(f"CSV sniffing failed for {file_path}, using default 'excel': {sniff_e}")
+                dialect = 'excel'
+                has_header = False # Safer default if sniffing fails
+
+            reader = csv.reader(f, dialect)
+            raw_headers = []
+            if has_header:
+                try:
+                    raw_headers = next(reader)
+                except Exception as header_e:
+                    logger.warning(f"Error reading CSV header in {file_path}: {header_e}")
+                    raw_headers = []
+
+            # Process headers: clean and ensure uniqueness
+            processed_headers = []
+            if raw_headers:
+                seen = set()
+                for h in raw_headers:
+                    # Basic cleaning
+                    clean_h = str(h).strip() if h is not None else ""
+                    original_h = clean_h
+                    counter = 1
+                    # Ensure unique header names
+                    while clean_h in seen:
+                        clean_h = f"{original_h}_{counter}"
+                        counter += 1
+                    seen.add(clean_h)
+                    processed_headers.append(clean_h)
+            else:
+                # No headers found, determine number of columns from first data row
+                try:
+                    first_data_row = next(reader, None)
+                    if first_data_row is not None:
+                        num_cols = len(first_data_row)
+                        # Put the first data row back by creating a new reader
+                        # This is a bit inefficient, but simple.
+                        # Alternative: store first_data_row and process it later.
+                        # Let's re-read the file to be cleaner.
+                        f.seek(0)
+                        if has_header:
+                            next(reader, None) # Skip header again if it was read
+                        # Now reader is back at the start of data rows
+                    else:
+                        num_cols = 0
+                except:
+                     num_cols = 0
+                processed_headers = [f"column_{i}" for i in range(num_cols)]
+                # If we had read a data row, it would be processed in the main loop below.
+                # To handle the first row correctly, we need to ensure the reader state is right.
+                # Let's just stick with re-reading logic for simplicity here.
+
+            # Re-initialize reader logic to correctly handle headers/data
+            f.seek(0)
+            reader = csv.reader(f, dialect)
+            if has_header:
+                 next(reader, None) # Skip header row
+
+            data = []
+            # Tags for all rows from this file will be the processed headers
+            # Add file path for context
+            base_tags = processed_headers + [file_path]
+
+            for i, row in enumerate(reader):
+                try:
+                    # Clean and convert all values to strings, handling None
+                    cleaned_values = [str(cell).strip() if cell is not None else "" for cell in row]
+
+                    # Create a dictionary for the row using processed headers
+                    row_dict = {}
+                    for j, value in enumerate(cleaned_values):
+                        if j < len(processed_headers):
+                            key = processed_headers[j]
+                        else:
+                            # Handle rows with more columns than headers
+                            key = f"extra_col_{j}"
+                        row_dict[key] = value
+
+                    # Store the row dictionary as a JSON string in 'content'
+                    content = json.dumps(row_dict, ensure_ascii=False)
+
+                    data.append({
+                        "content": content,
+                        "tags": base_tags.copy() # Include processed headers as tags
+                    })
+                except Exception as row_e:
+                    logger.warning(f"Error processing row {i} in {file_path}: {row_e}")
+
+            return data
+    except Exception as e:
+        logger.warning(f"CSV parse failed for {file_path}: {str(e)}")
+        # Final fallback: Treat as text block
+        with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
+            content = f.read(1000000) # Limit size
+            return [{"content": content, "tags": ["csv_fallback_text", file_path]}]
+
+def stream_parse_txt(file_path, chunk_size=100):
+    """
+    Streaming TXT parser with generators.
+    Attempts to split text into meaningful chunks (e.g., paragraphs).
+    Yields chunks of documents.
+    """
+    try:
+        with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
+            current_chunk = []
+            # Simple paragraph splitting logic
+            # You can adjust this delimiter or logic as needed
+            # For example, splitting by double newlines for paragraphs
+            buffer = ""
+            for line in f:
+                buffer += line
+                # Heuristic: Assume paragraphs are separated by blank lines
+                # Or, if a line is very long, treat it as a chunk
+                if line.strip() == "" or len(buffer) > 8000: # Empty line or buffer full
+                    if buffer.strip(): # If buffer has content
+                        current_chunk.append({
+                            "content": buffer.strip(), # Remove leading/trailing whitespace
+                            "tags": ["txt_paragraph"]
+                            })
+                        buffer = ""
+                        if len(current_chunk) >= chunk_size:
+                            yield current_chunk
+                            current_chunk = []
+                # Optional: Handle very long lines that don't get broken by paragraphs
+                if len(buffer) > 10000: # Safety net for extremely long lines
+                    current_chunk.append({
+                        "content": buffer.strip()[:10000], # Truncate if necessary
+                        "tags": ["txt_long_line"]
+                    })
+                    buffer = buffer[10000:] # Keep the rest in buffer
+
+            # Add the last piece if it exists
+            if buffer.strip():
+                 current_chunk.append({
+                    "content": buffer.strip(),
+                    "tags": ["txt_final"]
+                })
+
+            # Yield any remaining items in the current chunk
+            if current_chunk:
+                yield current_chunk
+
+    except Exception as e:
+        logger.warning(f"TXT parse failed for {file_path}: {str(e)}")
+        # Fallback: read in fixed-size blocks
+        with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
+            current_chunk = []
+            while True:
+                content = f.read(8192) # Read 8KB blocks
+                if not content:
+                    break
+                current_chunk.append({"content": content, "tags": ["txt_fallback_block"]})
+                if len(current_chunk) >= chunk_size:
+                    yield current_chunk
+                    current_chunk = []
+            if current_chunk:
+                yield current_chunk

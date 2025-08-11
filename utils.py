@@ -6,9 +6,11 @@ import asyncio
 import logging
 import inspect
 import traceback
-import time  # For retry mechanism
+import time
 import random
-import math  # For vector calculations
+import math
+import torch
+from embedding_queue import embedding_queue
 
 MAX_CONCURRENT_REQUESTS = 200
 EMBEDDING_DIMENSION = 1024
@@ -16,6 +18,16 @@ OLLAMA_API = "http://localhost:11434/api"
 logger = logging.getLogger()
 l_pre = f"{inspect.currentframe().f_code.co_name}-{inspect.currentframe().f_lineno}::"
 embedding_semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
+
+# Memory cleanup
+def cleanup_memory():
+    # Force garbage collection and clear GPU cache if necessary
+    import gc
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        logger.info("Memory cleanup performed")
+    return
 
 # Vector math utilities
 def cosine_similarity(a, b):
@@ -33,121 +45,57 @@ def is_zero_vector(vector):
     """Check if vector contains only zeros"""
     return all(x == 0 for x in vector)
 
-# Synchronous embedding with enhanced error handling
-def get_embedding(text):
-    max_retries = 3
-    for attempt in range(max_retries):
-        try:
-            # Use the embeddings endpoint directly
-            response = requests.post(
-                f"{OLLAMA_API}/embed",
-                json={"model": "dengcao/Qwen3-Embedding-0.6B:Q8_0", "input": text},
-                timeout=30
-            )
-            if response.status_code == 200:
-                data = response.json()
-                
-                # Handle different response formats
-                if "embedding" in data:
-                    embedding = data["embedding"]
-                elif "embeddings" in data and data["embeddings"]:
-                    embedding = data["embeddings"][0]
-                else:
-                    raise ValueError("Unexpected response format: no embedding found")
-                
-                # Validate embedding
-                if len(embedding) != EMBEDDING_DIMENSION:
-                    raise ValueError(
-                        f"Invalid embedding dimension: {len(embedding)} "
-                        f"(expected {EMBEDDING_DIMENSION})"
-                    )
-                
-                if is_zero_vector(embedding):
-                    raise ValueError("Zero vector embedding generated")
-                
-                return embedding
-            else:
-                raise Exception(f"API error: {response.status_code} - {response.text}")
-        except Exception as e:
-            logger.warning(f"Attempt {attempt+1} failed: {str(e)}")
-            if attempt < max_retries - 1:
-                sleep_time = 1 + random.random()  # Add jitter
-                time.sleep(sleep_time)
-                continue
-            raise Exception(f"Failed to get embedding after {max_retries} attempts: {str(e)}")
+def batched_gpu_cosine_similarity(query_embedding, db_embeddings_tensor):
+    """
+    Compute cosine similarity between a query vector and a batch of vectors on GPU.
+    Args:
+        query_embedding (list or np.array): The query embedding [dim].
+        db_embeddings_tensor (torch.Tensor): Database embeddings [batch_size, dim] on GPU.
+    Returns:
+        np.array: Cosine similarities [batch_size].
+    """
+    # Convert query to tensor and move to same device as db_embeddings_tensor
+    query_tensor = torch.tensor(query_embedding, dtype=torch.float32)
+    if db_embeddings_tensor.is_cuda:
+        query_tensor = query_tensor.cuda()
+    
+    # Ensure query is 2D [1, dim] for matrix multiplication
+    if query_tensor.dim() == 1:
+        query_tensor = query_tensor.unsqueeze(0)  # Shape: [1, dim]
+    
+    # Normalize vectors
+    query_norm = torch.nn.functional.normalize(query_tensor, p=2, dim=1)  # Shape: [1, dim]
+    db_norm = torch.nn.functional.normalize(db_embeddings_tensor, p=2, dim=1)  # Shape: [batch_size, dim]
+    
+    # Compute cosine similarity via dot product
+    # Result shape: [1, batch_size]
+    cos_sim = torch.mm(query_norm, db_norm.t())
+    
+    # Flatten and convert to numpy - always move to CPU first
+    return cos_sim.squeeze().cpu().numpy()
 
-# Async batch embeddings with comprehensive error handling
 async def get_embeddings_batch(session, texts):
-    """Batch process embeddings with comprehensive error handling"""
+    """Batch process embeddings using centralized queue"""
     if not texts:
         return []
-
-    async def fetch_one(text):
-        """Fetch a single embedding with proper timeout handling"""
-        max_retries = 3
-        for attempt in range(max_retries):
-            try:
-                async with embedding_semaphore:
-                    async with session.post(
-                        f"{OLLAMA_API}/embed",
-                        json={"model": "dengcao/Qwen3-Embedding-0.6B:Q8_0", "input": text},
-                        timeout=30
-                    ) as response:
-                        if response.status == 200:
-                            data = await response.json()
-                            
-                            # Handle both response formats
-                            if "embedding" in data:
-                                emb = data["embedding"]
-                            elif "embeddings" in data and data["embeddings"]:
-                                emb = data["embeddings"][0]
-                            else:
-                                raise ValueError("Unexpected response format")
-                            
-                            # Validate embedding
-                            if not emb:
-                                raise ValueError("Empty embedding received")
-                                
-                            if len(emb) != EMBEDDING_DIMENSION:
-                                raise ValueError(
-                                    f"Invalid dimension: {len(emb)} "
-                                    f"(expected {EMBEDDING_DIMENSION})"
-                                )
-                                
-                            if is_zero_vector(emb):
-                                raise ValueError("Zero vector generated")
-                                
-                            return emb
-                        else:
-                            error = await response.text()
-                            raise Exception(f"API error {response.status}: {error}")
-            except asyncio.TimeoutError:
-                logger.warning(f"Embedding timeout (attempt {attempt+1}/{max_retries})")
-                if attempt < max_retries - 1:
-                    await asyncio.sleep(1 + random.random())  # Add jitter
-                    continue
-                return None
-            except Exception as e:
-                logger.error(f"Embedding exception: {str(e)}\n{traceback.format_exc()}")
-                if attempt < max_retries - 1:
-                    await asyncio.sleep(1 + random.random())  # Add jitter
-                    continue
-                return None
-
-    # Create and process all tasks
-    tasks = [fetch_one(text) for text in texts]
     
-    # Process in chunks to avoid too many simultaneous tasks
-    embeddings = []
-    for i in range(0, len(tasks), 100):  # Process 100 at a time
-        chunk = tasks[i:i+100]
-        results = await asyncio.gather(*chunk, return_exceptions=True)
-        
-        # Process results
-        for j, result in enumerate(results):
-            if isinstance(result, Exception) or result is None:
-                embeddings.append(None)
-            else:
-                embeddings.append(result)
-                
-    return embeddings
+    # Start workers if not already started
+    if not embedding_queue.started:
+        await embedding_queue.start_workers(concurrency=10)
+    
+    # Return exceptions
+    return await asyncio.gather(*[embedding_queue.enqueue(text) for text in texts], return_exceptions=False)
+
+async def get_embedding_async(text):
+    # Async version for embedding generation
+    return await embedding_queue.enqueue(text)
+
+def get_embedding(text):
+    """Synchronous wrapper for async embedding generation"""
+    logging.warning("Using synchronous embedding call - avoid in async contexts")
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        return loop.run_until_complete(embedding_queue.enqueue(text))
+    finally:
+        loop.close()
