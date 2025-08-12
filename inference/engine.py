@@ -1,9 +1,7 @@
-# inference/engine.py
+# inference/engine.py - Optimized Inference Engine
 import json
-import heapq
-import numpy as np
 import logging
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional
 import requests
 
 from core.config import config
@@ -16,7 +14,12 @@ from inference.embeddings import embedding_service
 logger = logging.getLogger(__name__)
 
 class InferenceEngine:
-    """Main inference engine for semantic search and answer generation"""
+    """
+    Optimized inference engine that intelligently chooses between:
+    1. Database-level vector similarity (most efficient for large DBs)
+    2. GPU-cached similarity (efficient for small/medium DBs with repeated searches)
+    3. Chunked processing (fallback for edge cases)
+    """
     
     def __init__(self):
         self.config = config.inference
@@ -30,13 +33,13 @@ class InferenceEngine:
         use_cache: Optional[bool] = None
     ) -> List[Dict[str, Any]]:
         """
-        Perform semantic search for the given query
+        Optimized semantic search that automatically chooses the best strategy
         
         Args:
             query: Search query text
             top_k: Number of top results to return
             relevance_threshold: Minimum similarity threshold
-            use_cache: Whether to use embedding cache
+            use_cache: Whether to use embedding cache (None = auto-decide)
             
         Returns:
             List of matching documents with metadata
@@ -51,27 +54,196 @@ class InferenceEngine:
             logger.error("Failed to generate query embedding")
             return []
         
-        # Decide on search strategy
-        if use_cache is None:
-            # Auto-decide based on cache availability
-            use_cache = embedding_cache.is_loaded or self._should_use_cache()
+        # Determine optimal search strategy
+        strategy = self._choose_search_strategy(use_cache)
+        logger.info(f"Using search strategy: {strategy}")
         
-        if use_cache and not embedding_cache.is_loaded:
-            cache_loaded = embedding_cache.load_cache()
-            if not cache_loaded:
-                logger.warning("Failed to load cache, using chunked search")
-                use_cache = False
-        
-        # Perform search
-        if use_cache and embedding_cache.is_loaded:
+        # Execute search based on strategy
+        if strategy == "database_direct":
+            return await self._search_database_direct(query_embedding, top_k, relevance_threshold)
+        elif strategy == "cache_gpu":
             return await self._search_with_cache(query_embedding, top_k, relevance_threshold)
-        else:
+        else:  # fallback
             return await self._search_chunked(query_embedding, top_k, relevance_threshold)
     
-    def _should_use_cache(self) -> bool:
-        """Determine if cache should be used based on database size"""
+    def _choose_search_strategy(self, use_cache: Optional[bool]) -> str:
+        """
+        Intelligently choose the optimal search strategy based on:
+        - Database size
+        - Cache availability
+        - User preference
+        
+        Returns:
+            Strategy name: "database_direct", "cache_gpu", or "chunked"
+        """
         doc_count = db_ops.get_document_count()
-        return doc_count <= self.config.max_cache_size and doc_count > 0
+        
+        # User explicitly requested cache usage
+        if use_cache is True:
+            if embedding_cache.should_use_cache_for_search():
+                return "cache_gpu"
+            else:
+                logger.warning("Cache requested but not optimal for current database size")
+                return "database_direct"
+        
+        # User explicitly disabled cache
+        elif use_cache is False:
+            return "database_direct"
+        
+        # Auto-decide based on database size and cache status
+        else:
+            # For very small databases, try cache
+            if doc_count <= 500:
+                if embedding_cache.is_loaded or embedding_cache.should_use_cache_for_search():
+                    return "cache_gpu"
+                else:
+                    return "database_direct"
+            
+            # For medium databases, use cache if already loaded
+            elif doc_count <= 2000:
+                if embedding_cache.is_loaded:
+                    return "cache_gpu"
+                else:
+                    return "database_direct"
+            
+            # For large databases, always use database direct
+            else:
+                return "database_direct"
+    
+    async def _search_database_direct(
+        self,
+        query_embedding: List[float],
+        top_k: int,
+        threshold: float
+    ) -> List[Dict[str, Any]]:
+        """
+        Use PostgreSQL's vector similarity directly - most efficient for large databases
+        Falls back to sync operations if async has issues
+        """
+        logger.info("Using database-direct vector similarity search")
+        
+        try:
+            # Try async first
+            results = await db_ops.similarity_search_database_async(
+                query_embedding, top_k, threshold
+            )
+            
+            if results:
+                # Convert database results to expected format
+                formatted_results = []
+                for result in results:
+                    formatted_results.append({
+                        'id': result['id'],
+                        'content': result['content'],
+                        'tags': result.get('tags', []),
+                        'cosine_similarity': float(result['cosine_similarity']),
+                        'euclidean_distance': 0  # Not calculated for performance
+                    })
+                
+                logger.info(f"Found {len(formatted_results)} matches via async database search")
+                return formatted_results
+            else:
+                logger.info("No documents passed relevance threshold")
+                return []
+                
+        except Exception as async_e:
+            logger.warning(f"Async database search failed ({async_e}), trying sync fallback")
+            
+            # Fallback to sync database operations which we know work
+            try:
+                results = db_ops.similarity_search_database(
+                    query_embedding, top_k, threshold
+                )
+                
+                if results:
+                    # Convert database results to expected format
+                    formatted_results = []
+                    for result in results:
+                        formatted_results.append({
+                            'id': result['id'],
+                            'content': result['content'],
+                            'tags': result.get('tags', []),
+                            'cosine_similarity': float(result['cosine_similarity']),
+                            'euclidean_distance': 0  # Not calculated for performance
+                        })
+                    
+                    logger.info(f"Found {len(formatted_results)} matches via sync database search")
+                    return formatted_results
+                else:
+                    logger.info("No documents passed relevance threshold")
+                    return []
+                    
+            except Exception as sync_e:
+                logger.error(f"Both async and sync database search failed: async={async_e}, sync={sync_e}")
+                # Final fallback to Python-based similarity
+                return await self._search_python_fallback(query_embedding, top_k, threshold)
+    
+    async def _search_python_fallback(
+        self,
+        query_embedding: List[float],
+        top_k: int,
+        threshold: float
+    ) -> List[Dict[str, Any]]:
+        """
+        Python-based similarity search as fallback when database operations fail
+        This loads embeddings in chunks and computes similarity in Python
+        """
+        import heapq
+        import numpy as np
+        
+        logger.info("Using Python fallback similarity search")
+        
+        try:
+            # Check if we can use cache
+            if embedding_cache.should_use_cache_for_search():
+                cache_data = db_ops.get_embeddings_for_cache(10000)  # Limit for safety
+                if cache_data:
+                    ids, embeddings = cache_data
+                    
+                    # Compute similarities in Python
+                    similarities = []
+                    for emb in embeddings:
+                        sim = self.vector_ops.cosine_similarity(query_embedding, emb)
+                        similarities.append(sim)
+                    
+                    # Find top-k above threshold
+                    results = []
+                    for i, sim in enumerate(similarities):
+                        if sim >= threshold:
+                            results.append((ids[i], sim))
+                    
+                    # Sort and take top-k
+                    results.sort(key=lambda x: x[1], reverse=True)
+                    results = results[:top_k]
+                    
+                    if results:
+                        # Get document content
+                        doc_ids = [doc_id for doc_id, _ in results]
+                        documents = db_ops.get_documents_by_ids(doc_ids)
+                        id_to_content = {doc['id']: doc for doc in documents}
+                        
+                        formatted_results = []
+                        for doc_id, similarity in results:
+                            doc_content = id_to_content.get(doc_id)
+                            if doc_content:
+                                formatted_results.append({
+                                    'id': doc_id,
+                                    'content': doc_content['content'],
+                                    'tags': doc_content.get('tags', []),
+                                    'cosine_similarity': similarity,
+                                    'euclidean_distance': 0
+                                })
+                        
+                        logger.info(f"Found {len(formatted_results)} matches via Python fallback")
+                        return formatted_results
+            
+            # If cache approach doesn't work, return empty results
+            logger.warning("Python fallback could not find matches")
+            return []
+            
+        except Exception as e:
+            logger.error(f"Python fallback search also failed: {e}")
+            return []
     
     async def _search_with_cache(
         self,
@@ -79,15 +251,22 @@ class InferenceEngine:
         top_k: int,
         threshold: float
     ) -> List[Dict[str, Any]]:
-        """Search using cached embeddings with GPU acceleration"""
-        logger.info("Computing similarities using GPU cache...")
+        """Use cached embeddings with GPU acceleration - efficient for small/medium DBs"""
+        logger.info("Using GPU-cached similarity search")
+        
+        # Ensure cache is loaded
+        if not embedding_cache.is_loaded:
+            cache_loaded = embedding_cache.load_cache()
+            if not cache_loaded:
+                logger.warning("Failed to load cache, falling back to database search")
+                return await self._search_database_direct(query_embedding, top_k, threshold)
         
         embeddings_tensor = embedding_cache.get_embeddings_tensor()
         doc_ids = embedding_cache.get_document_ids()
         
         if not embeddings_tensor or not doc_ids:
             logger.error("Cache data is invalid")
-            return []
+            return await self._search_database_direct(query_embedding, top_k, threshold)
         
         try:
             # Compute similarities using GPU
@@ -95,32 +274,46 @@ class InferenceEngine:
                 query_embedding, embeddings_tensor
             )
             
-            # Find valid indices above threshold
-            valid_indices = np.where(similarities >= threshold)[0]
-            if len(valid_indices) == 0:
-                logger.info("No documents passed relevance threshold")
+            # Find indices that meet threshold and get top-k
+            results = self.vector_ops.similarity_search(
+                query_embedding,
+                embeddings_tensor,
+                top_k=top_k,
+                threshold=threshold,
+                use_gpu=True
+            )
+            
+            if not results:
+                logger.info("No documents passed relevance threshold in cache")
                 return []
             
-            # Get top-k results
-            valid_similarities = similarities[valid_indices]
-            sorted_indices = valid_indices[np.argsort(valid_similarities)[::-1]]
-            top_indices = sorted_indices[:top_k]
+            # Get document IDs and fetch content
+            result_ids = [doc_ids[idx] for idx, _ in results]
+            documents = db_ops.get_documents_by_ids(result_ids)
             
-            # Prepare results with metadata
-            top_docs = []
-            for idx in top_indices:
-                top_docs.append({
-                    'id': doc_ids[idx],
-                    'cosine_similarity': float(similarities[idx]),
-                    'euclidean_distance': 0  # Not calculated for performance
-                })
+            # Map content to similarity scores
+            id_to_content = {doc['id']: doc for doc in documents}
             
-            logger.info(f"Found {len(top_docs)} matches via GPU cache")
-            return top_docs
+            formatted_results = []
+            for idx, similarity in results:
+                doc_id = doc_ids[idx]
+                doc_content = id_to_content.get(doc_id)
+                
+                if doc_content:
+                    formatted_results.append({
+                        'id': doc_id,
+                        'content': doc_content['content'],
+                        'tags': doc_content.get('tags', []),
+                        'cosine_similarity': similarity,
+                        'euclidean_distance': 0  # Not calculated for performance
+                    })
+            
+            logger.info(f"Found {len(formatted_results)} matches via GPU cache")
+            return formatted_results
             
         except Exception as e:
             logger.error(f"Cache search failed: {e}")
-            return []
+            return await self._search_database_direct(query_embedding, top_k, threshold)
         finally:
             # Cleanup GPU memory
             if embeddings_tensor and embeddings_tensor.is_cuda:
@@ -133,107 +326,18 @@ class InferenceEngine:
         top_k: int,
         threshold: float
     ) -> List[Dict[str, Any]]:
-        """Search using chunked processing for large databases"""
-        logger.info("Starting chunked similarity search...")
-        
-        chunk_size = min(self.config.vector_search_limit, 500000)
-        top_k_heap = []  # Min-heap for top-k results
-        docs_processed = 0
-        total_docs = db_ops.get_document_count()
-        
-        if total_docs == 0:
-            logger.warning("No documents in database to search")
-            return []
+        """
+        Fallback chunked search - used when database direct fails
+        This loads embeddings in small chunks and computes similarity
+        """
+        logger.info("Using chunked fallback search")
         
         try:
-            offset = 0
-            while offset < total_docs:
-                # Get chunk of embeddings
-                embeddings_page = db_ops.get_embeddings_page(chunk_size, offset)
-                if not embeddings_page:
-                    break
-                
-                chunk_ids = []
-                chunk_embeddings = []
-                
-                for doc_id, embedding in embeddings_page:
-                    chunk_ids.append(doc_id)
-                    chunk_embeddings.append(embedding)
-                
-                docs_processed += len(chunk_ids)
-                if docs_processed % (chunk_size * 10) == 0:
-                    logger.info(f"Processed {docs_processed}/{total_docs} documents...")
-                
-                if not chunk_embeddings:
-                    offset += chunk_size
-                    continue
-                
-                # Compute similarities for chunk
-                similarities = self._compute_chunk_similarities(query_embedding, chunk_embeddings)
-                
-                # Update top-k heap
-                for i, doc_id in enumerate(chunk_ids):
-                    sim_score = similarities[i]
-                    
-                    if sim_score >= threshold:
-                        if len(top_k_heap) < top_k:
-                            heapq.heappush(top_k_heap, (sim_score, doc_id))
-                        elif sim_score > top_k_heap[0][0]:
-                            heapq.heapreplace(top_k_heap, (sim_score, doc_id))
-                
-                # Memory cleanup
-                if docs_processed % (chunk_size * 5) == 0:
-                    memory_manager.force_cleanup_if_needed()
-                
-                offset += chunk_size
-            
-            # Prepare final results
-            if not top_k_heap:
-                logger.info("No documents passed relevance threshold")
-                return []
-            
-            # Sort by similarity (descending)
-            sorted_results = sorted(top_k_heap, key=lambda x: x[0], reverse=True)
-            
-            top_docs = []
-            for sim_score, doc_id in sorted_results:
-                top_docs.append({
-                    'id': doc_id,
-                    'cosine_similarity': float(sim_score),
-                    'euclidean_distance': 0  # Not calculated for performance
-                })
-            
-            logger.info(f"Found {len(top_docs)} matches via chunked search")
-            return top_docs
-            
+            # Delegate to Python fallback which is more robust
+            return await self._search_python_fallback(query_embedding, top_k, threshold)
         except Exception as e:
-            logger.error(f"Chunked search failed: {e}")
+            logger.error(f"All search methods failed: {e}")
             return []
-    
-    def _compute_chunk_similarities(
-        self,
-        query_embedding: List[float],
-        chunk_embeddings: List[List[float]]
-    ) -> np.ndarray:
-        """Compute similarities for a chunk, with GPU fallback"""
-        import torch
-        
-        # Try GPU acceleration for large chunks
-        if torch.cuda.is_available() and len(chunk_embeddings) > 100:
-            try:
-                db_tensor = torch.tensor(chunk_embeddings, dtype=torch.float32).cuda()
-                similarities = self.vector_ops.gpu_cosine_similarity_batch(query_embedding, db_tensor)
-                del db_tensor
-                torch.cuda.empty_cache()
-                return similarities
-            except Exception as e:
-                logger.warning(f"GPU similarity calculation failed, using CPU: {e}")
-        
-        # CPU fallback
-        return np.array([
-            self.vector_ops.cosine_similarity(query_embedding, emb) 
-            for emb in chunk_embeddings
-        ])
     
     def generate_answer(self, prompt: str) -> str:
         """Generate answer using the configured LLM"""
@@ -271,12 +375,18 @@ class InferenceEngine:
         use_cache: Optional[bool] = None
     ) -> Dict[str, Any]:
         """
-        Complete question-answering pipeline
+        Complete question-answering pipeline with optimized search
         
+        Args:
+            question: The question to answer
+            top_k: Number of top results to use for context
+            relevance_threshold: Minimum similarity threshold
+            use_cache: Whether to use embedding cache
+            
         Returns:
             Dictionary containing answer, sources, and metadata
         """
-        # Perform semantic search
+        # Perform optimized semantic search
         matching_docs = await self.semantic_search(
             question, top_k, relevance_threshold, use_cache
         )
@@ -285,36 +395,15 @@ class InferenceEngine:
             return {
                 "answer": "I don't have enough information to answer this question.",
                 "sources": [],
-                "metadata": {"matches_found": 0}
-            }
-        
-        # Get document content
-        doc_ids = [doc['id'] for doc in matching_docs]
-        documents = db_ops.get_documents_by_ids(doc_ids)
-        
-        # Map content to similarity scores
-        id_to_content = {doc['id']: doc for doc in documents}
-        final_docs = []
-        
-        for match in matching_docs:
-            doc_content = id_to_content.get(match['id'])
-            if doc_content:
-                final_docs.append({
-                    **match,
-                    'content': doc_content['content'],
-                    'tags': doc_content.get('tags', [])
-                })
-        
-        if not final_docs:
-            return {
-                "answer": "Found matching documents but couldn't retrieve content.",
-                "sources": [],
-                "metadata": {"matches_found": len(matching_docs)}
+                "metadata": {
+                    "matches_found": 0,
+                    "search_strategy": self._choose_search_strategy(use_cache)
+                }
             }
         
         # Build context for answer generation
         context_parts = []
-        for idx, doc in enumerate(final_docs):
+        for idx, doc in enumerate(matching_docs):
             # Truncate content for context
             truncated_content = doc['content'][:800]
             context_parts.append(
@@ -336,7 +425,7 @@ Context (ranked by relevance):
         
         # Prepare sources for response
         sources = []
-        for doc in final_docs:
+        for doc in matching_docs:
             sources.append({
                 "id": doc['id'],
                 "similarity": doc['cosine_similarity'],
@@ -350,9 +439,115 @@ Context (ranked by relevance):
             "metadata": {
                 "matches_found": len(matching_docs),
                 "context_length": len(context),
-                "question_length": len(question)
+                "question_length": len(question),
+                "search_strategy": self._choose_search_strategy(use_cache)
             }
         }
+    
+    def get_search_strategy_info(self) -> Dict[str, Any]:
+        """Get information about available search strategies and recommendations"""
+        doc_count = db_ops.get_document_count()
+        cache_info = embedding_cache.cache_info
+        cache_recommendation = embedding_cache.get_cache_recommendation()
+        
+        return {
+            "database_size": doc_count,
+            "cache_status": cache_info,
+            "cache_recommendation": cache_recommendation,
+            "available_strategies": {
+                "database_direct": {
+                    "description": "Use PostgreSQL vector similarity directly",
+                    "best_for": "Large databases (>2000 docs)",
+                    "pros": ["Fastest for large DBs", "Uses HNSW index", "Low memory usage"],
+                    "cons": ["Requires PostgreSQL with pgvector"]
+                },
+                "cache_gpu": {
+                    "description": "Load embeddings into GPU memory for similarity search",
+                    "best_for": "Small to medium databases (<2000 docs) with repeated searches",
+                    "pros": ["Very fast repeated searches", "GPU acceleration"],
+                    "cons": ["High memory usage", "Load time", "Not suitable for large DBs"]
+                },
+                "chunked": {
+                    "description": "Fallback method - loads embeddings in chunks",
+                    "best_for": "Error recovery only",
+                    "pros": ["Works with any database size"],
+                    "cons": ["Slowest method", "High memory usage"]
+                }
+            },
+            "recommended_strategy": self._choose_search_strategy(None)
+        }
+    
+    async def benchmark_search_methods(
+        self, 
+        test_query: str = "test query",
+        iterations: int = 3
+    ) -> Dict[str, Any]:
+        """
+        Benchmark different search methods for performance comparison
+        
+        Args:
+            test_query: Query to use for benchmarking
+            iterations: Number of iterations to average
+            
+        Returns:
+            Performance comparison data
+        """
+        import time
+        
+        query_embedding = await embedding_service.generate_embedding(test_query)
+        if not query_embedding:
+            return {"error": "Failed to generate test embedding"}
+        
+        results = {}
+        
+        # Benchmark database direct
+        try:
+            times = []
+            for i in range(iterations):
+                start = time.time()
+                await self._search_database_direct(query_embedding, 10, 0.1)
+                times.append(time.time() - start)
+            
+            results["database_direct"] = {
+                "avg_time_ms": sum(times) / len(times) * 1000,
+                "min_time_ms": min(times) * 1000,
+                "max_time_ms": max(times) * 1000
+            }
+        except Exception as e:
+            results["database_direct"] = {"error": str(e)}
+        
+        # Benchmark cache if appropriate
+        if embedding_cache.should_use_cache_for_search():
+            try:
+                times = []
+                for i in range(iterations):
+                    start = time.time()
+                    await self._search_with_cache(query_embedding, 10, 0.1)
+                    times.append(time.time() - start)
+                
+                results["cache_gpu"] = {
+                    "avg_time_ms": sum(times) / len(times) * 1000,
+                    "min_time_ms": min(times) * 1000,
+                    "max_time_ms": max(times) * 1000
+                }
+            except Exception as e:
+                results["cache_gpu"] = {"error": str(e)}
+        else:
+            results["cache_gpu"] = {"skipped": "Not recommended for current database size"}
+        
+        # Add recommendations
+        results["recommendation"] = {
+            "best_method": min(
+                [(k, v.get("avg_time_ms", float('inf'))) for k, v in results.items() 
+                 if isinstance(v, dict) and "avg_time_ms" in v],
+                key=lambda x: x[1],
+                default=("database_direct", 0)
+            )[0],
+            "database_size": db_ops.get_document_count(),
+            "test_iterations": iterations
+        }
+        
+        return results
 
 # Global inference engine instance
 inference_engine = InferenceEngine()

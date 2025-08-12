@@ -74,10 +74,23 @@ class DatabaseConnection:
         conn = None
         try:
             conn = await pool.acquire()
-            await pgvector.asyncpg.register_vector(conn)
-            # Apply optimization settings
-            for setting, value in PG_OPTIMIZATION_SETTINGS.items():
-                await conn.execute(f"SET {setting} = $1", value)
+            # Register vector type with asyncpg - this is crucial for pgvector
+            try:
+                await pgvector.asyncpg.register_vector(conn)
+            except Exception as vector_e:
+                logger.warning(f"Could not register vector type: {vector_e}")
+                # If vector registration fails, this connection won't work for vector ops
+                raise Exception(f"Vector type registration failed: {vector_e}")
+            
+            # Apply optimization settings one by one to avoid parameter issues
+            try:
+                await conn.execute("SET statement_timeout = '300000'")
+                await conn.execute("SET work_mem = '16MB'") 
+                await conn.execute("SET maintenance_work_mem = '512MB'")
+                await conn.execute("SET jit = off")
+            except Exception as setting_e:
+                logger.debug(f"Could not apply all settings: {setting_e}")
+            
             yield conn
         except Exception as e:
             logger.error(f"Async connection error: {e}")
@@ -108,7 +121,8 @@ class DatabaseConnection:
         """Test async database connectivity"""
         try:
             async with self.get_async_connection() as conn:
-                result = await conn.fetchval("SELECT 1")
+                # Use a simple query without parameters to avoid asyncpg issues
+                result = await conn.fetchval("SELECT 1 as test")
                 return result == 1
         except Exception as e:
             logger.error(f"Async connection test failed: {e}")
