@@ -1,4 +1,4 @@
 **.log
-**.env
-**.json
-**__pycache__
+*.env
+*.json
+**/__pycache__
