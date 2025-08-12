@@ -18,7 +18,7 @@ Let's move on to the initial setup
 **`___`**
 
 **Installation:**
-**`- First`** create your condaenv or virtualenv.  Then, using the 'requirements.txt' file, run **``pip install -r requirements.txt`** which should install all required pip packages.
+**`- First`** create your condaenv or virtualenv.  Then, using the 'requirements.txt' file, run **`pip install -r requirements.txt`** which should install all required pip packages.
 **`- Second`** run the setup.sh bash file using **``bash setup.sh`** which will run you through the generation of the .env file and creation of the PostgreSQL database you will be using for storing your documents/data.  This process should also install PostgreSQL and pgvector if you do not have them installed already, as well as ollama (if you're on Arch Linux that is) if it's not already installed/running.  This is all very early stages and could use a fair bit of refinement--if you're comfortable, I would suggest setting up Postgres and Ollama on your own, as well as pulling the models *dengcao/Qwen3-Embed-0.6B:Q8_0*, *qwen3:8b*, *dengcao/Qwen3-Reranker-4B:Q5_K_M* and optionally installing CUDA, CUDnn, nVidia drivers, or the ROCm equivalence depending on your specific GPU brand and environment.  Keep in mind, CPU inferencing will always work by default, but even an 8GB GPU of some sort that can be leveraged computationally will MASSIVELY speed up the various RAG operations provided by this program.
 **`- Third`** now you should be ready to run the program assuming all tools are installed, models are pulled, and everything is up and running correctly!
 **`- Optional`** the *debug_database.py* file can be ran to ensure that your Database and tables are correctly setup.
