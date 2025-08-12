@@ -9,13 +9,13 @@ Currently in early tests on Arch Linux, and while I can ensure that all of this 
 
 Let's move on to the initial setup
 
-**`_____________________________________________________________________________________________________________________________________________________________________________________________________________`**
+**`____________________________________________________________________________________________________`**
 
 ## SETUP
 
 **`1. I would suggest either creating a conda environment or a virtualenv via Python to install all of the required Python packages.  Your mileage may vary, however, and feel free to let me know how it works out for you if you stray from this suggestion!`**
 
-**`_____________________________________________________________________________________________________________________________________________________________________________________________________________`**
+**`____________________________________________________________________________________________________`**
 
 **Installation:**
 
@@ -29,7 +29,7 @@ Let's move on to the initial setup
 
 Currently, the program supports *.txt*, *.py*, *.csv*, and *.json* filetypes for data ingestion/organization.  There will be more filetypes added in the future, but these are definitely early Alpha days.
 
-**`_______________________________________________________________________________________________________________________________________________________________________________________________________`**
+**`____________________________________________________________________________________________________`**
 
 **Operation:**
 
@@ -53,7 +53,7 @@ Currently, the program supports *.txt*, *.py*, *.csv*, and *.json* filetypes for
 
 **`- Menu Option 0`** - Exit -- Exits the program
 
-**`_____________________________________________________________________________________________________________________________________________________________________________________________________________`**
+**`____________________________________________________________________________________________________`**
 
 Ctrl + D is the easiest way to stop execution of the program
 
