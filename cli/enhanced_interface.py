@@ -255,12 +255,13 @@ class EnhancedCLIInterface:
             
             # Quick sample check instead of full discovery
             sample_files = 0
+            total_fc = 0
             for root, dirs, files in os.walk(folder_path):
-                for file in files[:10]:  # Just check first 10 files
+                for file in files[:30]:
                     file_path = os.path.join(root, file)
                     if Path(file_path).suffix.lower() in {'.py', '.txt', '.csv', '.json'}:
                         sample_files += 1
-                break  # Only check first directory
+                        total_fc += 1
             
             if sample_files == 0:
                 print("❌ No compatible files found in the selected folder")
@@ -280,7 +281,7 @@ class EnhancedCLIInterface:
             
             results = await instant_async_loader.load_folder_instant(
                 folder_path=folder_path,
-                total_files=1000,  # Estimated limit
+                total_files=total_fc,  # Estimated limit
                 enable_chunking=True,
                 enable_summarization=False
             )
