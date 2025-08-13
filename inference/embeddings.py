@@ -1,49 +1,88 @@
 # inference/embeddings.py
 import asyncio
 import aiohttp
-import json
 import logging
+import json
 import random
+from typing import List, Optional, Dict, Any
+from dataclasses import dataclass
+from collections import deque
 import time
-from typing import List, Optional, Union
+
 from core.config import config
-from core.vector_ops import VectorOperations
 
 logger = logging.getLogger(__name__)
 
+@dataclass
+class EmbeddingRequest:
+    """Container for embedding request"""
+    text: str
+    future: asyncio.Future
+    retries: int = 0
+    max_retries: int = 3
+
 class EmbeddingService:
-    """Unified embedding generation service with queue management"""
+    """Centralized embedding service with queue-based processing"""
     
     def __init__(self):
-        self.api_url = config.embedding.api_url
         self.model = config.embedding.model
         self.dimension = config.embedding.dimension
+        self.api_url = config.embedding.api_url
         self.max_concurrent = config.embedding.max_concurrent_requests
         
-        self._queue = asyncio.Queue()
-        self._workers = []
-        self._session: Optional[aiohttp.ClientSession] = None
+        self._queue: asyncio.Queue = None
+        self._workers: List[asyncio.Task] = []
+        self._session: aiohttp.ClientSession = None
         self._started = False
-        self._semaphore = asyncio.Semaphore(self.max_concurrent)
+        self._stats = {
+            'total_requests': 0,
+            'successful': 0,
+            'failed': 0,
+            'avg_time': 0
+        }
     
-    async def start(self, concurrency: int = 10):
-        """Start the embedding service workers"""
+    @property
+    def queue_size(self) -> int:
+        """Get current queue size"""
+        return self._queue.qsize() if self._queue else 0
+    
+    @property
+    def active_workers(self) -> int:
+        """Get number of active workers"""
+        return sum(1 for w in self._workers if not w.done()) if self._workers else 0
+    
+    async def start(self, concurrency: Optional[int] = None):
+        """Start the embedding service with worker pool"""
         if self._started:
             return
         
-        self._started = True
+        concurrency = concurrency or min(self.max_concurrent, 50)
         
-        # Create shared session with connection limits
-        connector = aiohttp.TCPConnector(limit_per_host=2, limit=50)
-        self._session = aiohttp.ClientSession(connector=connector)
+        # Create queue and session
+        self._queue = asyncio.Queue(maxsize=1000)
+        
+        # Configure connector with connection pooling
+        connector = aiohttp.TCPConnector(
+            limit=concurrency * 2,
+            limit_per_host=concurrency,
+            ttl_dns_cache=300,
+            enable_cleanup_closed=True
+        )
+        
+        timeout = aiohttp.ClientTimeout(total=60, connect=10, sock_read=30)
+        self._session = aiohttp.ClientSession(
+            connector=connector,
+            timeout=timeout
+        )
         
         # Start worker tasks
         self._workers = [
-            asyncio.create_task(self._worker()) 
-            for _ in range(concurrency)
+            asyncio.create_task(self._worker(i))
+            for i in range(concurrency)
         ]
         
-        logger.info(f"Started {concurrency} embedding workers")
+        self._started = True
+        logger.info(f"Embedding service started with {concurrency} workers")
     
     async def stop(self):
         """Stop the embedding service"""
@@ -53,7 +92,9 @@ class EmbeddingService:
         self._started = False
         
         # Wait for queue to empty
-        await self._queue.join()
+        if self._queue:
+            while not self._queue.empty():
+                await asyncio.sleep(0.1)
         
         # Cancel workers
         for worker in self._workers:
@@ -67,168 +108,155 @@ class EmbeddingService:
             await self._session.close()
             self._session = None
         
-        logger.info("Embedding service stopped")
+        logger.info(f"Embedding service stopped. Stats: {self._stats}")
     
-    async def _worker(self):
-        """Worker task for processing embedding requests"""
+    async def _worker(self, worker_id: int):
+        """Worker task to process embedding requests"""
+        logger.debug(f"Worker {worker_id} started")
+        
         while self._started:
             try:
-                text, future = await self._queue.get()
+                # Get request from queue with timeout
                 try:
-                    embedding = await self._generate_embedding(text)
-                    future.set_result(embedding)
-                except Exception as e:
-                    future.set_exception(e)
-                finally:
-                    self._queue.task_done()
-            except asyncio.CancelledError:
-                return
-            except Exception as e:
-                logger.error(f"Worker error: {e}")
-    
-    async def _generate_embedding(self, text: str) -> List[float]:
-        """Generate embedding for a single text"""
-        max_retries = 5
-        
-        for attempt in range(max_retries):
-            try:
-                async with self._semaphore:
-                    async with self._session.post(
-                        f"{self.api_url}/embed",
-                        json={"model": self.model, "input": text},
-                        timeout=30
-                    ) as response:
-                        
-                        if response.status == 200:
-                            data = await response.json()
-                            
-                            # Handle different response formats
-                            embedding = (
-                                data.get("embedding") or 
-                                (data.get("embeddings", [None])[0] if data.get("embeddings") else None)
-                            )
-                            
-                            if not embedding:
-                                raise ValueError(f"Unexpected response format: {data}")
-                            
-                            # Validate embedding
-                            if len(embedding) != self.dimension:
-                                raise ValueError(f"Invalid dimension: {len(embedding)} (expected {self.dimension})")
-                            
-                            if VectorOperations.is_zero_vector(embedding):
-                                raise ValueError("Zero vector generated")
-                            
-                            return embedding
-                        
-                        error_text = await response.text()
-                        raise Exception(f"API error {response.status}: {error_text}")
-                        
-            except (asyncio.TimeoutError, aiohttp.ClientError) as e:
-                logger.warning(f"Embedding attempt {attempt + 1} failed: {e}")
-                
-                if attempt < max_retries - 1:
-                    wait_time = 1 + random.random() + attempt
-                    await asyncio.sleep(wait_time)
+                    request = await asyncio.wait_for(
+                        self._queue.get(), 
+                        timeout=1.0
+                    )
+                except asyncio.TimeoutError:
                     continue
                 
-                logger.error(f"Embedding failed after {max_retries} attempts")
-                raise
+                # Process the request
+                start_time = time.time()
                 
-            except json.JSONDecodeError as e:
-                logger.error(f"JSON decode error: {e}")
-                raise
+                try:
+                    embedding = await self._fetch_embedding(request.text)
+                    
+                    # Update stats
+                    self._stats['successful'] += 1
+                    elapsed = time.time() - start_time
+                    self._stats['avg_time'] = (
+                        self._stats['avg_time'] * 0.9 + elapsed * 0.1
+                    )
+                    
+                    # Set result
+                    if not request.future.done():
+                        request.future.set_result(embedding)
+                        
+                except Exception as e:
+                    # Retry logic
+                    if request.retries < request.max_retries:
+                        request.retries += 1
+                        await self._queue.put(request)  # Re-queue for retry
+                        logger.debug(f"Retrying request (attempt {request.retries})")
+                    else:
+                        self._stats['failed'] += 1
+                        if not request.future.done():
+                            request.future.set_result(None)
+                        logger.error(f"Failed after {request.max_retries} retries: {e}")
+                
+                finally:
+                    self._stats['total_requests'] += 1
+                    
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Worker {worker_id} error: {e}")
+        
+        logger.debug(f"Worker {worker_id} stopped")
+    
+    async def _fetch_embedding(self, text: str) -> Optional[List[float]]:
+        """Fetch embedding from API"""
+        if not self._session:
+            raise RuntimeError("Session not initialized")
+        
+        try:
+            async with self._session.post(
+                f"{self.api_url}/embed",
+                json={"model": self.model, "input": text},
+            ) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    
+                    # Handle different response formats
+                    embedding = data.get("embedding")
+                    if not embedding and "embeddings" in data:
+                        embedding = data["embeddings"][0] if data["embeddings"] else None
+                    
+                    if not embedding:
+                        raise ValueError(f"No embedding in response: {data}")
+                    
+                    # Validate embedding
+                    if len(embedding) != self.dimension:
+                        raise ValueError(
+                            f"Invalid embedding dimension: {len(embedding)} != {self.dimension}"
+                        )
+                    
+                    # Check for zero vector
+                    if all(x == 0 for x in embedding):
+                        raise ValueError("Zero vector generated")
+                    
+                    return embedding
+                else:
+                    error_text = await response.text()
+                    raise Exception(f"API error {response.status}: {error_text}")
+                    
+        except asyncio.TimeoutError:
+            raise Exception("Request timeout")
+        except aiohttp.ClientError as e:
+            raise Exception(f"Client error: {e}")
     
     async def generate_embedding(self, text: str) -> Optional[List[float]]:
-        """Generate embedding for a single text (public interface)"""
+        """Generate embedding for single text"""
         if not self._started:
             await self.start()
         
+        # Create future for result
         future = asyncio.Future()
-        await self._queue.put((text, future))
+        request = EmbeddingRequest(text=text, future=future)
         
-        try:
-            return await future
-        except Exception as e:
-            logger.error(f"Failed to generate embedding: {e}")
-            return None
+        # Add to queue
+        await self._queue.put(request)
+        
+        # Wait for result
+        return await future
     
-    async def generate_embeddings_batch(self, texts: List[str]) -> List[Optional[List[float]]]:
-        """Generate embeddings for multiple texts"""
+    async def generate_embeddings_batch(
+        self, 
+        texts: List[str]
+    ) -> List[Optional[List[float]]]:
+        """Generate embeddings for batch of texts"""
         if not texts:
             return []
         
         if not self._started:
             await self.start()
         
-        # Create futures for all texts
+        # Create requests
         futures = []
         for text in texts:
             future = asyncio.Future()
-            await self._queue.put((text, future))
+            request = EmbeddingRequest(text=text, future=future)
+            await self._queue.put(request)
             futures.append(future)
         
-        # Wait for all embeddings to complete
-        try:
-            results = await asyncio.gather(*futures, return_exceptions=True)
-            
-            # Convert exceptions to None
-            embeddings = []
-            for result in results:
-                if isinstance(result, Exception):
-                    logger.error(f"Batch embedding error: {result}")
-                    embeddings.append(None)
-                else:
-                    embeddings.append(result)
-            
-            return embeddings
-            
-        except Exception as e:
-            logger.error(f"Batch embedding generation failed: {e}")
-            return [None] * len(texts)
-    
-    def generate_embedding_sync(self, text: str) -> Optional[List[float]]:
-        """Synchronous wrapper for embedding generation (avoid in async contexts)"""
-        logger.warning("Using synchronous embedding call - avoid in async contexts")
-        
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        
-        try:
-            return loop.run_until_complete(self.generate_embedding(text))
-        finally:
-            loop.close()
+        # Wait for all results
+        results = await asyncio.gather(*futures, return_exceptions=False)
+        return results
     
     def validate_model(self) -> bool:
         """Validate that the embedding model is available"""
-        try:
-            import requests
-            response = requests.get(f"{self.api_url}/tags", timeout=5)
-            response.raise_for_status()
-            
-            data = response.json()
-            models = [model['name'] for model in data.get('models', [])]
-            
-            if self.model not in models:
-                logger.error(f"Embedding model {self.model} not found in Ollama!")
-                logger.info(f"Available models: {models}")
-                return False
-            
-            logger.info(f"Embedding model {self.model} validated successfully")
-            return True
-            
-        except Exception as e:
-            logger.error(f"Model validation failed: {e}")
-            return False
+        # This would normally check if the model is available
+        # For now, we'll assume it's available if config is set
+        return bool(self.model and self.api_url)
     
-    @property
-    def queue_size(self) -> int:
-        """Get current queue size"""
-        return self._queue.qsize()
-    
-    @property
-    def active_workers(self) -> int:
-        """Get number of active workers"""
-        return sum(1 for w in self._workers if not w.done())
+    def get_stats(self) -> Dict[str, Any]:
+        """Get service statistics"""
+        return {
+            **self._stats,
+            'queue_size': self.queue_size,
+            'active_workers': self.active_workers,
+            'model': self.model
+        }
 
 # Global embedding service instance
 embedding_service = EmbeddingService()

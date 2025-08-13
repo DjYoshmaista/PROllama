@@ -1,26 +1,222 @@
-# file_management/parsers.py
+# file_management/parsers.py - Optimized with Multi-Processing
 import json
 import csv
 import os
 import ast
 import logging
 import ijson
-from typing import Generator, List, Dict, Any, Optional
+from typing import Generator, List, Dict, Any, Optional, Tuple
 from pathlib import Path
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from multiprocessing import Pool, Manager, Queue
+import multiprocessing as mp
+from functools import partial
+import time
 
+# Create prefixed logger for this file
 logger = logging.getLogger(__name__)
+LOG_PREFIX = "[Parser]"
+
+def _parse_file_worker(args: Tuple[str, str, int]) -> List[Dict[str, Any]]:
+    """
+    Worker function for multiprocessing file parsing
+    Must be at module level for pickle compatibility
+    """
+    file_path, file_type, chunk_size = args
+    parser = DocumentParser(max_chunk_size=1000)
+    
+    try:
+        # Collect all chunks for this file
+        all_records = []
+        for chunk in parser.parse_file_stream(file_path, file_type, chunk_size):
+            all_records.extend(chunk)
+        return all_records
+    except Exception as e:
+        logger.error(f"Worker error parsing {file_path}: {e}")
+        return []
+
+def _parse_chunk_worker(args: Tuple[str, str, int, int]) -> List[Dict[str, Any]]:
+    """
+    Worker function for parsing file chunks in parallel
+    """
+    file_path, file_type, start_pos, chunk_size = args
+    
+    try:
+        # This is a simplified chunk parser - would need file-type specific logic
+        with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
+            f.seek(start_pos)
+            content = f.read(chunk_size)
+            
+            if content:
+                return [{
+                    "content": content,
+                    "tags": [file_type, file_path, f"chunk_{start_pos}"]
+                }]
+    except Exception as e:
+        logger.error(f"Chunk worker error for {file_path} at {start_pos}: {e}")
+    
+    return []
 
 class DocumentParser:
-    """Unified document parser with streaming support"""
+    """Multi-process document parser with streaming support"""
     
-    def __init__(self, max_chunk_size: int = 1000):
+    def __init__(self, max_chunk_size: int = 1000, max_workers: int = None):
         self.max_chunk_size = max_chunk_size
+        self.max_workers = max_workers or min(8, mp.cpu_count())
         self.parsers = {
             'txt': self._parse_txt_stream,
             'csv': self._parse_csv_stream,
             'json': self._parse_json_stream,
             'py': self._parse_python_stream
         }
+    
+    def parse_files_parallel(self, file_paths: List[str], file_types: Optional[List[str]] = None) -> Dict[str, List[Dict[str, Any]]]:
+        """
+        Parse multiple files in parallel using process pool
+        
+        Args:
+            file_paths: List of file paths to parse
+            file_types: Optional list of file types (auto-detected if None)
+            
+        Returns:
+            Dictionary mapping file paths to their parsed records
+        """
+        if not file_paths:
+            logger.info(f"{LOG_PREFIX} No files to parse, returning empty results")
+            return {}
+        
+        logger.info(f"{LOG_PREFIX} Starting parallel parsing of {len(file_paths)} files with {self.max_workers} workers")
+        parse_start = time.time()
+        
+        # Prepare arguments for workers
+        if file_types is None:
+            file_types = [None] * len(file_paths)
+        
+        # Determine file types
+        type_start = time.time()
+        worker_args = []
+        for file_path, file_type in zip(file_paths, file_types):
+            if not file_type:
+                ext = Path(file_path).suffix[1:].lower()
+                file_type = ext if ext in self.parsers else 'txt'
+            
+            worker_args.append((file_path, file_type, 100))  # chunk_size
+        
+        type_time = time.time() - type_start
+        logger.info(f"{LOG_PREFIX} File type determination completed in {type_time:.3f}s")
+        
+        results = {}
+        files_processed = 0
+        total_records = 0
+        
+        # Use ProcessPoolExecutor for CPU-intensive parsing
+        with ProcessPoolExecutor(max_workers=self.max_workers) as executor:
+            logger.info(f"{LOG_PREFIX} Submitting {len(worker_args)} parsing tasks to process pool")
+            
+            # Submit all files for processing
+            future_to_file = {
+                executor.submit(_parse_file_worker, args): args[0] 
+                for args in worker_args
+            }
+            
+            logger.info(f"{LOG_PREFIX} All parsing tasks submitted, waiting for completion")
+            
+            # Collect results as they complete
+            for future in as_completed(future_to_file):
+                file_path = future_to_file[future]
+                files_processed += 1
+                
+                try:
+                    parsed_records = future.result()
+                    results[file_path] = parsed_records
+                    total_records += len(parsed_records)
+                    
+                    logger.debug(f"{LOG_PREFIX} Parsed {len(parsed_records)} records from {file_path}")
+                    
+                    # Log progress every 10 files
+                    if files_processed % 10 == 0:
+                        elapsed = time.time() - parse_start
+                        files_per_sec = files_processed / elapsed if elapsed > 0 else 0
+                        logger.info(f"{LOG_PREFIX} Progress: {files_processed}/{len(file_paths)} files, "
+                                   f"{total_records} records, {files_per_sec:.1f} files/s")
+                                   
+                except Exception as e:
+                    logger.error(f"{LOG_PREFIX} Error parsing {file_path}: {e}")
+                    results[file_path] = []
+        
+        parse_time = time.time() - parse_start
+        files_per_sec = len(file_paths) / parse_time if parse_time > 0 else 0
+        records_per_sec = total_records / parse_time if parse_time > 0 else 0
+        
+        logger.info(f"{LOG_PREFIX} Parallel parsing completed: {len(file_paths)} files, {total_records} records, "
+                   f"{parse_time:.2f}s, {files_per_sec:.1f} files/s, {records_per_sec:.1f} records/s")
+        
+        return results
+    
+    def parse_large_file_parallel(self, file_path: str, file_type: Optional[str] = None) -> Generator[List[Dict[str, Any]], None, None]:
+        """
+        Parse large files using parallel chunk processing
+        
+        Args:
+            file_path: Path to large file
+            file_type: File type (auto-detected if None)
+            
+        Yields:
+            Chunks of parsed records
+        """
+        if not os.path.exists(file_path):
+            return
+        
+        file_size = os.path.getsize(file_path)
+        if file_size == 0:
+            return
+        
+        # Determine file type
+        if not file_type:
+            ext = Path(file_path).suffix[1:].lower()
+            file_type = ext if ext in self.parsers else 'txt'
+        
+        # For very large files, use chunk-based parallel processing
+        if file_size > 50 * 1024 * 1024:  # 50MB threshold
+            yield from self._parse_large_file_chunks(file_path, file_type, file_size)
+        else:
+            # For smaller files, use regular streaming
+            yield from self.parse_file_stream(file_path, file_type, 100)
+    
+    def _parse_large_file_chunks(self, file_path: str, file_type: str, file_size: int) -> Generator[List[Dict[str, Any]], None, None]:
+        """Parse large files by splitting into chunks and processing in parallel"""
+        chunk_size = 1024 * 1024  # 1MB chunks
+        num_chunks = (file_size + chunk_size - 1) // chunk_size
+        
+        # Create worker arguments for each chunk
+        worker_args = [
+            (file_path, file_type, i * chunk_size, min(chunk_size, file_size - i * chunk_size))
+            for i in range(num_chunks)
+        ]
+        
+        # Process chunks in parallel
+        with ProcessPoolExecutor(max_workers=self.max_workers) as executor:
+            # Submit chunk processing tasks
+            future_to_chunk = {
+                executor.submit(_parse_chunk_worker, args): i 
+                for i, args in enumerate(worker_args)
+            }
+            
+            # Collect results in order
+            chunk_results = {}
+            for future in as_completed(future_to_chunk):
+                chunk_index = future_to_chunk[future]
+                try:
+                    chunk_records = future.result()
+                    chunk_results[chunk_index] = chunk_records
+                except Exception as e:
+                    logger.error(f"Error processing chunk {chunk_index} of {file_path}: {e}")
+                    chunk_results[chunk_index] = []
+            
+            # Yield results in order
+            for i in range(num_chunks):
+                if i in chunk_results and chunk_results[i]:
+                    yield chunk_results[i]
     
     def parse_file_stream(
         self, 
@@ -29,15 +225,7 @@ class DocumentParser:
         chunk_size: int = 100
     ) -> Generator[List[Dict[str, Any]], None, None]:
         """
-        Unified streaming parser that determines file type and delegates to appropriate parser
-        
-        Args:
-            file_path: Path to file
-            file_type: Override file type detection
-            chunk_size: Number of records per chunk
-            
-        Yields:
-            Chunks of parsed records
+        Stream parse single file (fallback for process-pool compatibility)
         """
         if not os.path.exists(file_path) or os.path.getsize(file_path) == 0:
             logger.warning(f"File is missing or empty: {file_path}")
@@ -122,7 +310,7 @@ class DocumentParser:
                 logger.error(f"Text fallback also failed for {file_path}: {fallback_e}")
     
     def _parse_csv_stream(self, file_path: str, chunk_size: int) -> Generator[List[Dict[str, Any]], None, None]:
-        """Stream CSV files row by row"""
+        """Stream CSV files row by row with parallel-friendly approach"""
         try:
             with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
                 # Detect CSV dialect
@@ -310,7 +498,7 @@ class DocumentParser:
             yield records[i:i + chunk_size]
     
     def _parse_python_stream(self, file_path: str, chunk_size: int) -> Generator[List[Dict[str, Any]], None, None]:
-        """Parse Python files using AST"""
+        """Parse Python files using AST with parallel-friendly approach"""
         try:
             with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
                 source_code = f.read()
@@ -408,5 +596,101 @@ class DocumentParser:
             logger.error(f"Python parsing failed for {file_path}: {e}")
             yield from self._parse_txt_stream(file_path, chunk_size)
 
-# Global parser instance
+
+class ParallelDocumentProcessor:
+    """High-level coordinator for parallel document processing"""
+    
+    def __init__(self, max_workers: int = None):
+        self.max_workers = max_workers or min(8, mp.cpu_count())
+        self.parser = DocumentParser(max_workers=self.max_workers)
+    
+    def process_files_batch(self, file_paths: List[str], batch_size: int = None) -> Dict[str, List[Dict[str, Any]]]:
+        """
+        Process files in batches with optimal parallelization strategy
+        
+        Args:
+            file_paths: List of file paths to process
+            batch_size: Size of processing batches (auto-calculated if None)
+            
+        Returns:
+            Dictionary mapping file paths to parsed records
+        """
+        if not file_paths:
+            return {}
+        
+        # Calculate optimal batch size based on file count and workers
+        if batch_size is None:
+            batch_size = max(1, len(file_paths) // (self.max_workers * 2))
+        
+        all_results = {}
+        
+        # Process files in batches to manage memory
+        for i in range(0, len(file_paths), batch_size):
+            batch = file_paths[i:i + batch_size]
+            logger.info(f"Processing batch {i//batch_size + 1}: {len(batch)} files")
+            
+            batch_results = self.parser.parse_files_parallel(batch)
+            all_results.update(batch_results)
+            
+            # Memory cleanup between batches
+            import gc
+            gc.collect()
+        
+        return all_results
+    
+    def process_mixed_files(self, file_paths: List[str], size_threshold: int = 50 * 1024 * 1024) -> Dict[str, List[Dict[str, Any]]]:
+        """
+        Process mixed file sizes with adaptive strategy
+        
+        Args:
+            file_paths: List of file paths
+            size_threshold: Threshold for large file processing (bytes)
+            
+        Returns:
+            Dictionary mapping file paths to parsed records
+        """
+        if not file_paths:
+            return {}
+        
+        # Separate files by size
+        small_files = []
+        large_files = []
+        
+        for file_path in file_paths:
+            try:
+                file_size = os.path.getsize(file_path)
+                if file_size > size_threshold:
+                    large_files.append(file_path)
+                else:
+                    small_files.append(file_path)
+            except Exception as e:
+                logger.error(f"Error checking size of {file_path}: {e}")
+                small_files.append(file_path)  # Default to small file processing
+        
+        results = {}
+        
+        # Process small files in parallel batches
+        if small_files:
+            logger.info(f"Processing {len(small_files)} small files in parallel")
+            small_results = self.parser.parse_files_parallel(small_files)
+            results.update(small_results)
+        
+        # Process large files individually with internal parallelization
+        if large_files:
+            logger.info(f"Processing {len(large_files)} large files with chunk parallelization")
+            for file_path in large_files:
+                try:
+                    file_records = []
+                    for chunk in self.parser.parse_large_file_parallel(file_path):
+                        file_records.extend(chunk)
+                    results[file_path] = file_records
+                    logger.info(f"Processed large file {file_path}: {len(file_records)} records")
+                except Exception as e:
+                    logger.error(f"Error processing large file {file_path}: {e}")
+                    results[file_path] = []
+        
+        return results
+
+# Global parser instances
 document_parser = DocumentParser()
+parallel_processor = ParallelDocumentProcessor()

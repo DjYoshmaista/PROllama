@@ -1,22 +1,119 @@
-# file_management/discovery.py
+# file_management/discovery.py - Optimized with Multi-Threading
 import os
 import logging
-from typing import Generator, List, Optional, Set
+from typing import Generator, List, Optional, Set, Tuple
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
+from queue import Queue, Empty
+import time
 
+# Create prefixed logger for this file
 logger = logging.getLogger(__name__)
+LOG_PREFIX = "[Discovery]"
 
 class FileDiscovery:
-    """Handles file discovery, validation, and path management"""
+    """Handles parallel file discovery, validation, and path management"""
     
     SUPPORTED_EXTENSIONS = {"py", "txt", "csv", "json"}
     
-    def __init__(self, supported_extensions: Optional[Set[str]] = None):
+    def __init__(self, supported_extensions: Optional[Set[str]] = None, max_workers: int = 8):
         self.supported_extensions = supported_extensions or self.SUPPORTED_EXTENSIONS
+        self.max_workers = max_workers
+        self._results_queue = Queue()
+        self._discovery_lock = threading.Lock()
+    
+    def discover_files_parallel(self, folder_path: str) -> Generator[str, None, None]:
+        """
+        Parallel file discovery using thread pool for directory traversal
+        
+        Args:
+            folder_path: Root folder to search
+            
+        Yields:
+            File paths for supported files as they're discovered
+        """
+        logger.info(f"{LOG_PREFIX} Starting parallel file discovery in: {folder_path}")
+        discovery_start = time.time()
+        
+        # Get all subdirectories first
+        subdir_start = time.time()
+        subdirs = self._get_subdirectories(folder_path)
+        subdirs.append(folder_path)  # Include root directory
+        subdir_time = time.time() - subdir_start
+        
+        logger.info(f"{LOG_PREFIX} Found {len(subdirs)} directories to scan in {subdir_time:.3f}s")
+        print(f"{LOG_PREFIX} Scanning {len(subdirs)} directories with {self.max_workers} workers...")
+        
+        files_found = 0
+        directories_processed = 0
+        
+        # Use ThreadPoolExecutor for parallel directory scanning
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            logger.info(f"{LOG_PREFIX} Starting parallel directory scanning with {self.max_workers} workers")
+            
+            # Submit directory scanning tasks
+            future_to_dir = {
+                executor.submit(self._scan_directory, subdir): subdir 
+                for subdir in subdirs
+            }
+            
+            logger.info(f"{LOG_PREFIX} Submitted {len(future_to_dir)} directory scanning tasks")
+            
+            # Yield files as they're discovered
+            for future in as_completed(future_to_dir):
+                directories_processed += 1
+                try:
+                    files = future.result()
+                    dir_path = future_to_dir[future]
+                    
+                    logger.debug(f"{LOG_PREFIX} Directory {dir_path} yielded {len(files)} files")
+                    
+                    for file_path in files:
+                        files_found += 1
+                        yield file_path
+                        
+                        # Log progress every 100 files
+                        if files_found % 100 == 0:
+                            logger.info(f"{LOG_PREFIX} Progress: {files_found} files found, {directories_processed}/{len(subdirs)} dirs processed")
+                            
+                except Exception as e:
+                    dir_path = future_to_dir[future]
+                    logger.error(f"{LOG_PREFIX} Error scanning directory {dir_path}: {e}")
+        
+        discovery_time = time.time() - discovery_start
+        logger.info(f"{LOG_PREFIX} Parallel file discovery completed: {files_found} files in {discovery_time:.2f}s")
+        print(f"{LOG_PREFIX} Discovery complete: {files_found} files found in {discovery_time:.2f}s")
+    
+    def _get_subdirectories(self, folder_path: str) -> List[str]:
+        """Get all subdirectories for parallel processing"""
+        subdirs = []
+        try:
+            for root, dirs, _ in os.walk(folder_path):
+                for d in dirs:
+                    subdirs.append(os.path.join(root, d))
+        except Exception as e:
+            logger.error(f"Error getting subdirectories from {folder_path}: {e}")
+        return subdirs
+    
+    def _scan_directory(self, directory: str) -> List[str]:
+        """Scan a single directory for supported files (thread-safe)"""
+        files = []
+        try:
+            for item in os.listdir(directory):
+                file_path = os.path.join(directory, item)
+                if os.path.isfile(file_path) and self.is_supported_file(file_path):
+                    files.append(file_path)
+        except (PermissionError, OSError) as e:
+            logger.debug(f"Cannot access directory {directory}: {e}")
+        except Exception as e:
+            logger.error(f"Error scanning directory {directory}: {e}")
+        
+        return files
     
     def discover_files(self, folder_path: str) -> Generator[str, None, None]:
         """
-        Generator that yields supported file paths from a folder
+        Smart file discovery that chooses between parallel and sequential based on folder size
         
         Args:
             folder_path: Root folder to search
@@ -24,6 +121,18 @@ class FileDiscovery:
         Yields:
             File paths for supported files
         """
+        # Quick check of folder size to determine strategy
+        dir_count = self._estimate_directory_count(folder_path)
+        
+        if dir_count > 10:  # Use parallel for larger folder structures
+            logger.info(f"Using parallel discovery for {dir_count} directories")
+            yield from self.discover_files_parallel(folder_path)
+        else:
+            logger.info(f"Using sequential discovery for {dir_count} directories")
+            yield from self._discover_files_sequential(folder_path)
+    
+    def _discover_files_sequential(self, folder_path: str) -> Generator[str, None, None]:
+        """Original sequential discovery (kept for small folders)"""
         try:
             for root, _, files in os.walk(folder_path):
                 for file in files:
@@ -33,18 +142,50 @@ class FileDiscovery:
         except Exception as e:
             logger.error(f"Error discovering files in {folder_path}: {e}")
     
+    def _estimate_directory_count(self, folder_path: str) -> int:
+        """Quickly estimate number of directories for strategy selection"""
+        count = 0
+        try:
+            for root, dirs, _ in os.walk(folder_path):
+                count += len(dirs)
+                if count > 20:  # Early exit for large structures
+                    break
+        except Exception:
+            pass
+        return count
+    
+    def count_files_parallel(self, folder_path: str) -> int:
+        """Count supported files using parallel processing"""
+        count = 0
+        for _ in self.discover_files_parallel(folder_path):
+            count += 1
+        return count
+    
     def count_files(self, folder_path: str) -> int:
-        """Count supported files in a folder"""
+        """Count supported files in a folder (auto-selects strategy)"""
+        logger.info(f"{LOG_PREFIX} Starting file count for folder: {folder_path}")
+        count_start = time.time()
+        
         count = 0
         try:
             for _ in self.discover_files(folder_path):
                 count += 1
+                
+                # Log progress for large counts
+                if count % 500 == 0:
+                    logger.info(f"{LOG_PREFIX} File counting progress: {count} files so far")
+                    
         except Exception as e:
-            logger.error(f"Error counting files in {folder_path}: {e}")
+            logger.error(f"{LOG_PREFIX} Error counting files in {folder_path}: {e}")
+            
+        count_time = time.time() - count_start
+        logger.info(f"{LOG_PREFIX} File count completed: {count} files in {count_time:.2f}s")
+        print(f"{LOG_PREFIX} Found {count} files in {count_time:.2f}s")
+        
         return count
     
     def is_supported_file(self, file_path: str) -> bool:
-        """Check if file has supported extension and is accessible"""
+        """Check if file has supported extension and is accessible (thread-safe)"""
         try:
             # Check extension
             ext = Path(file_path).suffix[1:].lower()
@@ -60,7 +201,6 @@ class FileDiscovery:
             
             # Skip empty files
             if os.path.getsize(file_path) == 0:
-                logger.debug(f"Skipping empty file: {file_path}")
                 return False
             
             return True
@@ -96,8 +236,35 @@ class FileDiscovery:
             logger.error(f"Error validating folder path {folder_path}: {e}")
             return False
     
+    def get_files_with_info_parallel(self, folder_path: str) -> List[Tuple[str, dict]]:
+        """
+        Get files with their info using parallel processing
+        Returns list of (file_path, file_info) tuples
+        """
+        files_with_info = []
+        
+        # Discover files in parallel
+        files = list(self.discover_files_parallel(folder_path))
+        
+        # Get file info in parallel
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            future_to_file = {
+                executor.submit(self.get_file_info, file_path): file_path 
+                for file_path in files
+            }
+            
+            for future in as_completed(future_to_file):
+                file_path = future_to_file[future]
+                try:
+                    file_info = future.result()
+                    files_with_info.append((file_path, file_info))
+                except Exception as e:
+                    logger.error(f"Error getting info for {file_path}: {e}")
+        
+        return files_with_info
+    
     def get_file_info(self, file_path: str) -> dict:
-        """Get detailed information about a file"""
+        """Get detailed information about a file (thread-safe)"""
         try:
             stat = os.stat(file_path)
             return {
@@ -114,16 +281,16 @@ class FileDiscovery:
             return {'path': file_path, 'error': str(e)}
     
     def preview_folder_contents(self, folder_path: str, max_files: int = 10) -> List[dict]:
-        """Get a preview of files in a folder"""
+        """Get a preview of files in a folder using parallel processing"""
         preview = []
         
         try:
-            file_gen = self.discover_files(folder_path)
-            for i, file_path in enumerate(file_gen):
+            files_with_info = self.get_files_with_info_parallel(folder_path)
+            
+            for i, (file_path, info) in enumerate(files_with_info):
                 if i >= max_files:
                     break
                 
-                info = self.get_file_info(file_path)
                 rel_path = os.path.relpath(file_path, folder_path)
                 info['relative_path'] = rel_path
                 preview.append(info)
@@ -133,8 +300,8 @@ class FileDiscovery:
         
         return preview
     
-    def get_folder_stats(self, folder_path: str) -> dict:
-        """Get statistics about files in a folder"""
+    def get_folder_stats_parallel(self, folder_path: str) -> dict:
+        """Get statistics about files in a folder using fully parallel processing with concurrent futures"""
         stats = {
             'total_files': 0,
             'total_size_mb': 0,
@@ -144,26 +311,100 @@ class FileDiscovery:
         }
         
         try:
+            # Use parallel file discovery and statistics gathering
+            file_paths = list(self.discover_files_parallel(folder_path))
+            
+            if not file_paths:
+                return stats
+            
+            # Process file info collection in parallel batches
+            files_with_info = []
+            batch_size = max(100, len(file_paths) // (self.max_workers * 2))
+            
+            for i in range(0, len(file_paths), batch_size):
+                batch = file_paths[i:i + batch_size]
+                
+                with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+                    future_to_file = {
+                        executor.submit(self.get_file_info, file_path): file_path 
+                        for file_path in batch
+                    }
+                    
+                    for future in as_completed(future_to_file):
+                        file_path = future_to_file[future]
+                        try:
+                            file_info = future.result()
+                            files_with_info.append((file_path, file_info))
+                        except Exception as e:
+                            logger.error(f"Error getting info for {file_path}: {e}")
+            
+            # Aggregate statistics in parallel
             largest_size = 0
             smallest_size = float('inf')
             
-            for file_path in self.discover_files(folder_path):
-                info = self.get_file_info(file_path)
+            # Process aggregation using parallel reduction pattern
+            def process_file_batch(batch_info):
+                batch_stats = {
+                    'count': 0,
+                    'size_mb': 0,
+                    'extensions': {},
+                    'largest': (0, None),
+                    'smallest': (float('inf'), None)
+                }
                 
-                stats['total_files'] += 1
-                stats['total_size_mb'] += info.get('size_mb', 0)
+                for file_path, info in batch_info:
+                    if 'error' in info:
+                        continue
+                        
+                    batch_stats['count'] += 1
+                    batch_stats['size_mb'] += info.get('size_mb', 0)
+                    
+                    ext = info.get('extension', 'unknown')
+                    batch_stats['extensions'][ext] = batch_stats['extensions'].get(ext, 0) + 1
+                    
+                    size = info.get('size_bytes', 0)
+                    if size > batch_stats['largest'][0]:
+                        batch_stats['largest'] = (size, info)
+                    
+                    if size < batch_stats['smallest'][0]:
+                        batch_stats['smallest'] = (size, info)
                 
-                ext = info.get('extension', 'unknown')
-                stats['by_extension'][ext] = stats['by_extension'].get(ext, 0) + 1
+                return batch_stats
+            
+            # Process in parallel batches
+            batch_results = []
+            info_batch_size = max(50, len(files_with_info) // self.max_workers)
+            
+            with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+                batch_futures = []
+                for i in range(0, len(files_with_info), info_batch_size):
+                    batch = files_with_info[i:i + info_batch_size]
+                    if batch:
+                        future = executor.submit(process_file_batch, batch)
+                        batch_futures.append(future)
                 
-                size = info.get('size_bytes', 0)
-                if size > largest_size:
-                    largest_size = size
-                    stats['largest_file'] = info
+                for future in as_completed(batch_futures):
+                    try:
+                        batch_result = future.result()
+                        batch_results.append(batch_result)
+                    except Exception as e:
+                        logger.error(f"Error processing batch: {e}")
+            
+            # Merge results
+            for batch_result in batch_results:
+                stats['total_files'] += batch_result['count']
+                stats['total_size_mb'] += batch_result['size_mb']
                 
-                if size < smallest_size:
-                    smallest_size = size
-                    stats['smallest_file'] = info
+                for ext, count in batch_result['extensions'].items():
+                    stats['by_extension'][ext] = stats['by_extension'].get(ext, 0) + count
+                
+                if batch_result['largest'][0] > largest_size:
+                    largest_size = batch_result['largest'][0]
+                    stats['largest_file'] = batch_result['largest'][1]
+                
+                if batch_result['smallest'][0] < smallest_size:
+                    smallest_size = batch_result['smallest'][0]
+                    stats['smallest_file'] = batch_result['smallest'][1]
                     
         except Exception as e:
             logger.error(f"Error getting folder stats for {folder_path}: {e}")
@@ -177,6 +418,10 @@ class InteractiveFileSelector:
     def __init__(self, discovery: Optional[FileDiscovery] = None):
         self.discovery = discovery or FileDiscovery()
     
+    def get_folder_path(self) -> Optional[str]:
+        """Alias for browse_for_folder for backward compatibility"""
+        return self.browse_for_folder()
+        
     def browse_for_folder(self) -> Optional[str]:
         """Browse for folder with GUI fallback to CLI"""
         # Try GUI first
@@ -250,8 +495,8 @@ class InteractiveFileSelector:
             
             # Validate the folder path
             if self.discovery.validate_folder_path(folder_path):
-                # Show preview and confirm
-                if self._confirm_folder_selection(folder_path):
+                # Show preview and confirm using parallel processing
+                if self._confirm_folder_selection_parallel(folder_path):
                     return folder_path
             else:
                 print(f"\nError: Invalid folder path: {folder_path}")
@@ -259,12 +504,16 @@ class InteractiveFileSelector:
                 if retry != 'y':
                     return None
     
-    def _confirm_folder_selection(self, folder_path: str) -> bool:
-        """Show folder preview and confirm selection"""
-        # Get folder statistics
-        stats = self.discovery.get_folder_stats(folder_path)
+    def _confirm_folder_selection_parallel(self, folder_path: str) -> bool:
+        """Show folder preview and confirm selection using parallel processing"""
+        print("\nAnalyzing folder (using parallel processing)...")
+        start_time = time.time()
         
-        print(f"\nFolder Analysis:")
+        # Get folder statistics using parallel processing
+        stats = self.discovery.get_folder_stats_parallel(folder_path)
+        analysis_time = time.time() - start_time
+        
+        print(f"\nFolder Analysis (completed in {analysis_time:.2f}s):")
         print(f"Total supported files: {stats['total_files']}")
         print(f"Total size: {stats['total_size_mb']:.2f} MB")
         
@@ -273,7 +522,7 @@ class InteractiveFileSelector:
             for ext, count in stats['by_extension'].items():
                 print(f"  .{ext}: {count} files")
         
-        # Show preview of files
+        # Show preview of files using parallel processing
         preview = self.discovery.preview_folder_contents(folder_path, 10)
         if preview:
             print("\nPreview of files (first 10):")
