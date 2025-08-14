@@ -10,46 +10,24 @@ logger = logging.getLogger()
 MAX_CHUNK_SIZE = 1000  # Maximum records per chunk for streaming
 
 # --- Wrapper function ---
-def stream_parse_file(file_path, default_type=None, chunk_size=100):
-    """
-    Unified streaming parser wrapper.
-    Determines file type, prompts for default if needed/selected,
-    and calls the appropriate stream_parse_* function.
-    """
+def stream_parse_file(file_path, file_type=None, chunk_size=100):
+    """Unified streaming parser"""
     if not os.path.exists(file_path) or os.path.getsize(file_path) == 0:
-        logger.warning(f"File is missing or empty: {file_path}")
-        return # Yield nothing
+        return
 
-    # Determine file type from extension
-    _, ext = os.path.splitext(file_path)
-    file_type = ext[1:].lower() if ext else None # Remove the leading dot
-
-    # If type cannot be determined or user wants to override
-    if not file_type or file_type not in ['txt', 'csv', 'json', 'py']:
-        if default_type and default_type in ['txt', 'csv', 'json', 'py']:
-            logger.info(f"Using default type '{default_type}' for {file_path}")
-            file_type = default_type
-        else:
-            # Could prompt user here, but for streaming/bulk, a programmatic default or skip might be better
-            # For now, we'll log and skip unknown types, or treat as text as a fallback
-            logger.warning(f"Unknown or unsupported file type '{file_type}' for {file_path}. Treating as 'txt'.")
-            file_type = 'txt' # Default fallback
-
-    # Dispatch to the correct parser
+    ext = os.path.splitext(file_path)[1][1:].lower()
+    file_type = file_type or ext or 'txt'
+    
     try:
-        if file_type == 'txt':
-            yield from stream_parse_txt(file_path, chunk_size)
-        elif file_type == 'csv':
+        if file_type == 'csv':
             yield from stream_parse_csv(file_path, chunk_size)
         elif file_type == 'json':
             yield from stream_parse_json(file_path, chunk_size)
         elif file_type == 'py':
             yield from stream_parse_py(file_path, chunk_size)
         else:
-            # This should ideally not be reached due to the check above, but as a safeguard
-            logger.error(f"No parser available for type '{file_type}' (file: {file_path})")
-            # Fallback to text parsing
             yield from stream_parse_txt(file_path, chunk_size)
+
     except Exception as e:
         logger.error(f"Error during streaming parse of {file_path} ({file_type}): {e}", exc_info=True)
         # Final fallback: yield the file content as a single text chunk
@@ -440,73 +418,6 @@ def stream_parse_py(file_path, chunk_size=100):
             content = f.read(1000000) # Limit size
             yield [{"content": content, "tags": ["py_parse_fallback", file_path]}]
 
-def parse_json(file_path):
-    """Parse JSON file, storing each top-level item as a separate document.
-    Preserves structure by storing items as JSON strings.
-    """
-    try:
-        with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
-           raw_data = f.read()
-           if not raw_data.strip(): # Handle empty files
-               logger.info(f"JSON file is empty: {file_path}")
-               return []
-           data = json.loads(raw_data)
-    except json.JSONDecodeError as je:
-        logger.error(f"JSON decode error in {file_path}: {je}")
-        return []
-    except Exception as e:
-        logger.error(f"Error reading JSON file {file_path}: {e}")
-        return []
-
-    result = []
-    base_tags = ["structured_json", file_path]
-
-    if isinstance(data, list):
-        # Handle JSON array: Each item becomes a document
-        for i, item in enumerate(data):
-            try:
-                # Store the item itself as a JSON string
-                content = json.dumps(item, ensure_ascii=False)
-                # Tags can include the index or type of item
-                item_tags = base_tags.copy()
-                if isinstance(item, dict):
-                    # Add top-level keys of the item as tags
-                    item_tags.extend(list(item.keys())[:20])
-                elif isinstance(item, (list, str, int, float, bool)) or item is None:
-                    # Scalar or array item
-                    item_tags.append(type(item).__name__)
-                    pass # Keep tags simple
-                result.append({"content": content, "tags": item_tags})
-            except Exception as item_e:
-                logger.warning(f"Error serializing item {i} in JSON array {file_path}: {item_e}")
-                # result.append({"content": f"Error serializing item {i}: {item_e}", "tags": item_tags + ["error"]})
-
-    elif isinstance(data, dict):
-        # Handle single JSON object: The whole object is one document
-        try:
-            content = json.dumps(data, ensure_ascii=False)
-            # Tags can include top-level keys of the object
-            object_tags = base_tags.copy() # + list(data.keys())[:10] # Example: limit tags
-            result.append({"content": content, "tags": base_tags.copy()}) # Keep tags simple
-        except Exception as obj_e:
-            logger.error(f"Error serializing JSON object {file_path}: {obj_e}")
-            # result.append({"content": f"Error serializing object: {obj_e}", "tags": base_tags.copy() + ["error"]})
-    else:
-        # Handle scalar JSON values (number, string, boolean, null)
-        try:
-            content = json.dumps(data, ensure_ascii=False)
-            result.append({"content": content, "tags": base_tags.copy()}) # Keep tags simple
-        except Exception as scalar_e:
-            logger.error(f"Error serializing JSON scalar {file_path}: {scalar_e}")
-            # result.append({"content": f"Error serializing scalar: {scalar_e}", "tags": base_tags.copy() + ["error"]})
-
-    # Consider adding metadata about the JSON structure? Optional.
-    # e.g., if it was an array, its length, etc.
-    metadata_content = json.dumps({"type": "json_summary", "structure": type(data).__name__, "file": file_path}, ensure_ascii=False)
-    result.insert(0, {"content": metadata_content, "tags": base_tags.copy() + ["metadata"]})
-
-    return result
-
 def parse_file(file_path, file_type):
     """Legacy function for non-streaming parsing. Returns all data at once."""
     try:
@@ -530,122 +441,6 @@ def parse_file(file_path, file_type):
     except Exception as e:
         logger.error(f"Parse error ({file_path}): {e}")
         return []
-
-def parse_txt(file_path):
-    with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
-        content = f.read(100000000)  # Limit to 100MB
-    return [{"content": content, "tags": []}]
-
-def safe_parse_csv(file_path):
-    """Robust CSV parsing with multiple fallback strategies.
-       Stores each row as a JSON object string to preserve structure.
-       Tags include the original headers/column names for that file.
-    """
-    try:
-        with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
-            # Skip problematic characters
-            sample = f.read(10240).replace('\0', '')
-            f.seek(0)
-            # Try to detect dialect
-            try:
-                sniffer = csv.Sniffer()
-                dialect = sniffer.sniff(sample)
-                has_header = sniffer.has_header(sample)
-            except Exception as sniff_e:
-                logger.debug(f"CSV sniffing failed for {file_path}, using default 'excel': {sniff_e}")
-                dialect = 'excel'
-                has_header = False # Safer default if sniffing fails
-
-            reader = csv.reader(f, dialect)
-            raw_headers = []
-            if has_header:
-                try:
-                    raw_headers = next(reader)
-                except Exception as header_e:
-                    logger.warning(f"Error reading CSV header in {file_path}: {header_e}")
-                    raw_headers = []
-
-            # Process headers: clean and ensure uniqueness
-            processed_headers = []
-            if raw_headers:
-                seen = set()
-                for h in raw_headers:
-                    # Basic cleaning
-                    clean_h = str(h).strip() if h is not None else ""
-                    original_h = clean_h
-                    counter = 1
-                    # Ensure unique header names
-                    while clean_h in seen:
-                        clean_h = f"{original_h}_{counter}"
-                        counter += 1
-                    seen.add(clean_h)
-                    processed_headers.append(clean_h)
-            else:
-                # No headers found, determine number of columns from first data row
-                try:
-                    first_data_row = next(reader, None)
-                    if first_data_row is not None:
-                        num_cols = len(first_data_row)
-                        # Put the first data row back by creating a new reader
-                        # This is a bit inefficient, but simple.
-                        # Alternative: store first_data_row and process it later.
-                        # Let's re-read the file to be cleaner.
-                        f.seek(0)
-                        if has_header:
-                            next(reader, None) # Skip header again if it was read
-                        # Now reader is back at the start of data rows
-                    else:
-                        num_cols = 0
-                except:
-                     num_cols = 0
-                processed_headers = [f"column_{i}" for i in range(num_cols)]
-                # If we had read a data row, it would be processed in the main loop below.
-                # To handle the first row correctly, we need to ensure the reader state is right.
-                # Let's just stick with re-reading logic for simplicity here.
-
-            # Re-initialize reader logic to correctly handle headers/data
-            f.seek(0)
-            reader = csv.reader(f, dialect)
-            if has_header:
-                 next(reader, None) # Skip header row
-
-            data = []
-            # Tags for all rows from this file will be the processed headers
-            # Add file path for context
-            base_tags = processed_headers + [file_path]
-
-            for i, row in enumerate(reader):
-                try:
-                    # Clean and convert all values to strings, handling None
-                    cleaned_values = [str(cell).strip() if cell is not None else "" for cell in row]
-
-                    # Create a dictionary for the row using processed headers
-                    row_dict = {}
-                    for j, value in enumerate(cleaned_values):
-                        if j < len(processed_headers):
-                            key = processed_headers[j]
-                        else:
-                            # Handle rows with more columns than headers
-                            key = f"extra_col_{j}"
-                        row_dict[key] = value
-
-                    # Store the row dictionary as a JSON string in 'content'
-                    content = json.dumps(row_dict, ensure_ascii=False)
-
-                    data.append({
-                        "content": content,
-                        "tags": base_tags.copy() # Include processed headers as tags
-                    })
-                except Exception as row_e:
-                    logger.warning(f"Error processing row {i} in {file_path}: {row_e}")
-
-            return data
-    except Exception as e:
-        logger.warning(f"CSV parse failed for {file_path}: {str(e)}")
-        # Final fallback: Treat as text block
-        with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
-            content = f.read(1000000) # Limit size
-            return [{"content": content, "tags": ["csv_fallback_text", file_path]}]
 
 def stream_parse_txt(file_path, chunk_size=100):
     """
