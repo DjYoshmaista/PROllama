@@ -5,14 +5,12 @@ import heapq
 import json
 from json import JSONDecodeError
 import numpy as np
-import torch
-from embedding_queue import embedding_queue  # FIXED: Added missing import
-from contextlib import contextmanager, asynccontextmanager  # FIXED: Added asynccontextmanager
+from embedding_queue import embedding_queue
+from contextlib import contextmanager, asynccontextmanager
 from config import Config
 from db import db_manager
 from vector_math import batched_cosine_similarity
 from gpu_utils import cleanup_memory
-import inspect
 
 logger = logging.getLogger(__name__)
 table_name = Config.TABLE_NAME

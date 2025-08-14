@@ -4,7 +4,9 @@ import csv
 import os
 import ast
 import logging
+import re
 from config import Config
+from typing import List, Generator, Dict, Any, Optional
 
 # FIXED: Conditional import with fallback for ijson
 try:
@@ -16,9 +18,91 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+class TokenOverlapProcessor:
+    """Handles token overlap between chunks"""
+    
+    OVERLAP_TOKENS = 32
+    
+    @staticmethod
+    def estimate_tokens(text: str) -> int:
+        """Rough token estimation - 1 token ≈ 4 characters for most languages"""
+        return len(text) // 4
+    
+    @staticmethod
+    def get_token_boundaries(text: str, target_tokens: int) -> int:
+        """Find character position closest to target token count"""
+        estimated_chars = target_tokens * 4
+        if estimated_chars >= len(text):
+            return len(text)
+        
+        # Try to break at word boundaries near the target
+        target_pos = min(estimated_chars, len(text))
+        
+        # Look for word boundary within ±50 characters
+        for offset in range(50):
+            # Check forward
+            pos = target_pos + offset
+            if pos < len(text) and text[pos].isspace():
+                return pos
+            
+            # Check backward
+            pos = target_pos - offset
+            if pos > 0 and text[pos].isspace():
+                return pos
+        
+        # Fall back to exact position if no word boundary found
+        return target_pos
+    
+    @classmethod
+    def create_overlapping_chunks(cls, content: str, chunk_size_tokens: int = 500) -> List[str]:
+        """
+        Split content into overlapping chunks
+        
+        Args:
+            content: Text content to split
+            chunk_size_tokens: Target size for each chunk in tokens
+            
+        Returns:
+            List of overlapping text chunks
+        """
+        if not content.strip():
+            return []
+        
+        total_tokens = cls.estimate_tokens(content)
+        
+        # If content is smaller than one chunk, return as-is
+        if total_tokens <= chunk_size_tokens:
+            return [content]
+        
+        chunks = []
+        start_pos = 0
+        
+        while start_pos < len(content):
+            # Calculate end position for this chunk
+            end_tokens = chunk_size_tokens
+            end_pos = cls.get_token_boundaries(content[start_pos:], end_tokens)
+            end_pos += start_pos
+            
+            # Extract chunk
+            chunk = content[start_pos:end_pos].strip()
+            if chunk:
+                chunks.append(chunk)
+            
+            # If this is the last chunk, break
+            if end_pos >= len(content):
+                break
+            
+            # Calculate overlap for next chunk
+            overlap_chars = cls.get_token_boundaries(content[start_pos:end_pos], cls.OVERLAP_TOKENS)
+            
+            # Start next chunk with overlap
+            start_pos = max(start_pos + 1, end_pos - overlap_chars)
+        
+        return chunks
+
 # --- Wrapper function ---
 def stream_parse_file(file_path, file_type=None, chunk_size=None):
-    """Unified streaming parser"""
+    """Unified streaming parser with token overlap"""
     chunk_size = chunk_size or Config.CHUNK_SIZES['file_processing']
     
     if not os.path.exists(file_path) or os.path.getsize(file_path) == 0:
@@ -49,9 +133,9 @@ def stream_parse_file(file_path, file_type=None, chunk_size=None):
             yield [{"content": f"Failed to parse or read file: {file_path}", "tags": ["parse_error", file_path]}]
 
 def stream_parse_csv(file_path, chunk_size=100):
-    """Streaming CSV parser with generators.
-       Stores each row as a JSON object string to preserve structure.
-       Tags include the original headers/column names for that file.
+    """
+    Streaming CSV parser with token overlap for large cells
+    Each row becomes a record, but large cells are split with overlap
     """
     try:
         with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
@@ -91,7 +175,6 @@ def stream_parse_csv(file_path, chunk_size=100):
             else:
                 # Determine number of columns from the first data row
                 try:
-                    # Use a temporary reader to peek
                     f_temp = open(file_path, 'r', encoding='utf-8', errors='replace')
                     temp_reader = csv.reader(f_temp, dialect)
                     if has_header:
@@ -106,14 +189,12 @@ def stream_parse_csv(file_path, chunk_size=100):
                     logger.warning(f"Error peeking for CSV column count in {file_path}: {peek_e}")
                     num_cols = 0
                 processed_headers = [f"column_{i}" for i in range(num_cols)]
-                # Reset main reader state
                 f.seek(0)
                 reader = csv.reader(f, dialect)
                 if has_header:
-                    next(reader, None) # Skip header again
+                    next(reader, None)
 
             current_chunk = []
-            # Tags for all rows from this file will be the processed headers + file path
             base_tags = processed_headers + [file_path]
 
             for i, row in enumerate(reader):
@@ -127,11 +208,24 @@ def stream_parse_csv(file_path, chunk_size=100):
                             key = f"extra_col_{j}"
                         row_dict[key] = value
 
+                    # Create base content
                     content = json.dumps(row_dict, ensure_ascii=False)
-                    current_chunk.append({
-                        "content": content,
-                        "tags": base_tags.copy() # Include processed headers as tags
-                    })
+                    
+                    # Check if content is very large and needs overlap splitting
+                    if TokenOverlapProcessor.estimate_tokens(content) > 500:
+                        # Split large CSV rows with overlap
+                        chunks = TokenOverlapProcessor.create_overlapping_chunks(content, 500)
+                        for chunk_idx, chunk in enumerate(chunks):
+                            chunk_tags = base_tags + [f"csv_large_row_{i}_chunk_{chunk_idx}"]
+                            current_chunk.append({
+                                "content": chunk,
+                                "tags": chunk_tags
+                            })
+                    else:
+                        current_chunk.append({
+                            "content": content,
+                            "tags": base_tags.copy()
+                        })
 
                     if len(current_chunk) >= chunk_size:
                         yield current_chunk
@@ -148,13 +242,11 @@ def stream_parse_csv(file_path, chunk_size=100):
             yield [{"content": content, "tags": ["csv_fallback_text_streaming", file_path]}]
 
 def stream_parse_json(file_path, chunk_size=100):
-    """Streaming JSON parser with generators.
-       Parses structure, captures hierarchy, and yields chunks of elements.
-       Tags include top-level keys for objects.
+    """
+    Streaming JSON parser with token overlap for large objects
     """
     try:
         with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
-            # FIXED: Check if ijson is available before using it
             first_char = f.read(1)
             if first_char == '[' and HAS_IJSON:
                 f.seek(0)
@@ -164,8 +256,8 @@ def stream_parse_json(file_path, chunk_size=100):
                 object_depth = 0
                 in_object = False
                 key = None
-                # Base tags for items in this file
                 base_tags = [file_path]
+                
                 for prefix, event, value in parser:
                     if event == 'start_map':
                         if object_depth == 0:
@@ -175,11 +267,18 @@ def stream_parse_json(file_path, chunk_size=100):
                     elif event == 'end_map':
                         object_depth -= 1
                         if object_depth == 0 and in_object:
-                            # Content is the serialized object
                             content = json.dumps(current_object, ensure_ascii=False)
-                            # Tags are file path + object's top-level keys
                             tags = base_tags.copy() + [str(k) for k in current_object.keys()]
-                            current_chunk.append({"content": content, "tags": tags})
+                            
+                            # Check if object is large and needs overlap splitting
+                            if TokenOverlapProcessor.estimate_tokens(content) > 500:
+                                chunks = TokenOverlapProcessor.create_overlapping_chunks(content, 500)
+                                for chunk_idx, chunk in enumerate(chunks):
+                                    chunk_tags = tags + [f"json_large_object_chunk_{chunk_idx}"]
+                                    current_chunk.append({"content": chunk, "tags": chunk_tags})
+                            else:
+                                current_chunk.append({"content": content, "tags": tags})
+                            
                             in_object = False
                             if len(current_chunk) >= chunk_size:
                                 yield current_chunk
@@ -194,9 +293,9 @@ def stream_parse_json(file_path, chunk_size=100):
                 # Single JSON object or scalar, or ijson not available
                 f.seek(0)
                 data = json.load(f)
-                # Reuse logic from non-streaming parse_json, but yield in chunks
                 base_tags = [file_path]
                 records_to_yield = []
+                
                 if isinstance(data, list):
                     for item in data:
                         try:
@@ -204,7 +303,15 @@ def stream_parse_json(file_path, chunk_size=100):
                             item_tags = base_tags.copy()
                             if isinstance(item, dict):
                                 item_tags.extend([str(k) for k in item.keys()])
-                            records_to_yield.append({"content": content, "tags": item_tags})
+                            
+                            # Apply overlap splitting if needed
+                            if TokenOverlapProcessor.estimate_tokens(content) > 500:
+                                chunks = TokenOverlapProcessor.create_overlapping_chunks(content, 500)
+                                for chunk_idx, chunk in enumerate(chunks):
+                                    chunk_tags = item_tags + [f"json_array_item_chunk_{chunk_idx}"]
+                                    records_to_yield.append({"content": chunk, "tags": chunk_tags})
+                            else:
+                                records_to_yield.append({"content": content, "tags": item_tags})
                         except Exception as item_e:
                             logger.warning(f"Error serializing item in JSON array {file_path}: {item_e}")
 
@@ -215,23 +322,30 @@ def stream_parse_json(file_path, chunk_size=100):
                 elif isinstance(data, dict):
                     content = json.dumps(data, ensure_ascii=False)
                     tags = base_tags.copy() + [str(k) for k in data.keys()]
-                    yield [{"content": content, "tags": tags}]
+                    
+                    # Apply overlap splitting if needed
+                    if TokenOverlapProcessor.estimate_tokens(content) > 500:
+                        chunks = TokenOverlapProcessor.create_overlapping_chunks(content, 500)
+                        chunk_records = []
+                        for chunk_idx, chunk in enumerate(chunks):
+                            chunk_tags = tags + [f"json_object_chunk_{chunk_idx}"]
+                            chunk_records.append({"content": chunk, "tags": chunk_tags})
+                        yield chunk_records
+                    else:
+                        yield [{"content": content, "tags": tags}]
                 else: # Scalar
                     content = json.dumps(data, ensure_ascii=False)
                     tags = base_tags.copy()
                     yield [{"content": content, "tags": tags}]
     except Exception as e:
         logger.warning(f"JSON stream parse failed for {file_path}: {str(e)}")
-        # Fallback: treat as text
         with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
             content = f.read(1000000)
             yield [{"content": content, "tags": [file_path, "json_fallback_text"]}]
 
 def stream_parse_py(file_path, chunk_size=100):
     """
-    Streaming Python (.py) file parser using AST.
-    Parses structure, captures hierarchy, and yields chunks of elements.
-    Each element includes its parent path for tracing.
+    Streaming Python file parser with token overlap for large functions/classes
     """
     try:
         with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
@@ -245,51 +359,30 @@ def stream_parse_py(file_path, chunk_size=100):
         tree = ast.parse(source_code, filename=file_path)
 
         current_chunk = []
-        # Stack to keep track of the current nesting (e.g., ['ClassName', 'method_name'])
         parent_stack = []
 
         def get_source_segment(node):
-            """Get the source code segment for a node."""
+            """Get the source code segment for a node with overlap handling"""
             try:
                 if hasattr(ast, 'get_source_segment'):
-                    return ast.get_source_segment(source_code, node)
-                else:
-                    # Fallback: reconstruct or use basic info
-                    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-                        lines = source_code.splitlines()
-                        if 1 <= node.lineno <= len(lines):
-                            sig_line = lines[node.lineno - 1] # lineno is 1-based
-                            indent = ""
-                            if sig_line.startswith((' ', '\t')):
-                                 for char in sig_line:
-                                     if char in (' ', '\t'):
-                                         indent += char
-                                     else:
-                                         break
-                            return f"{indent}# ... (code for {node.name}) ..."
-                    return f"# Source segment for {type(node).__name__} not available"
+                    segment = ast.get_source_segment(source_code, node)
+                    if segment:
+                        return segment
+                
+                # Fallback: extract lines manually
+                if hasattr(node, 'lineno') and hasattr(node, 'end_lineno'):
+                    lines = source_code.splitlines()
+                    start_line = max(0, node.lineno - 1)
+                    end_line = min(len(lines), getattr(node, 'end_lineno', node.lineno))
+                    return '\n'.join(lines[start_line:end_line])
+                
+                return f"# Source for {getattr(node, 'name', type(node).__name__)} not available"
             except Exception as e:
                 logger.debug(f"Could not get source segment for node in {file_path}: {e}")
                 return f"# Error getting source segment: {e}"
 
-        def get_indentation(node, source_lines):
-            """Determine the indentation string for a node."""
-            try:
-                if 1 <= node.lineno <= len(source_lines):
-                    line = source_lines[node.lineno - 1]
-                    indent = ""
-                    for char in line:
-                        if char in (' ', '\t'):
-                            indent += char
-                        else:
-                            break
-                    return indent
-                return ""
-            except:
-                 return ""
-
         def process_node(node):
-            """Recursively process AST nodes."""
+            """Recursively process AST nodes with overlap splitting"""
             nonlocal current_chunk
 
             element_info = None
@@ -297,7 +390,6 @@ def stream_parse_py(file_path, chunk_size=100):
             source_lines = source_code.splitlines()
 
             if isinstance(node, ast.Module):
-                # The module itself represents the file
                 element_info = {
                     "type": "module",
                     "name": "__main__",
@@ -305,7 +397,6 @@ def stream_parse_py(file_path, chunk_size=100):
                     "parent_path": [],
                     "source_segment": source_segment,
                     "line_number": 1,
-                    "indentation": "",
                     "docstring": ast.get_docstring(node) if hasattr(ast, 'get_docstring') else None
                 }
                 parent_stack.append("__main__")
@@ -314,9 +405,6 @@ def stream_parse_py(file_path, chunk_size=100):
                 element_type = "class" if isinstance(node, ast.ClassDef) else ("async_function" if isinstance(node, ast.AsyncFunctionDef) else "function")
                 element_name = node.name
 
-                # Determine indentation
-                indent_str = get_indentation(node, source_lines)
-
                 element_info = {
                     "type": element_type,
                     "name": element_name,
@@ -324,15 +412,23 @@ def stream_parse_py(file_path, chunk_size=100):
                     "parent_path": list(parent_stack),
                     "source_segment": source_segment,
                     "line_number": getattr(node, 'lineno', -1),
-                    "indentation": indent_str,
                     "docstring": ast.get_docstring(node) if hasattr(ast, 'get_docstring') else None
                 }
 
-                # Add to chunk
-                current_chunk.append({
-                    "content": json.dumps(element_info, ensure_ascii=False),
-                    "tags": [element_type, file_context['file_path']]
-                })
+                # Convert to JSON content
+                content = json.dumps(element_info, ensure_ascii=False)
+                
+                # Apply overlap splitting if the source segment is large
+                if TokenOverlapProcessor.estimate_tokens(content) > 500:
+                    chunks = TokenOverlapProcessor.create_overlapping_chunks(content, 500)
+                    for chunk_idx, chunk in enumerate(chunks):
+                        chunk_tags = [element_type, file_context['file_path'], f"{element_name}_chunk_{chunk_idx}"]
+                        current_chunk.append({"content": chunk, "tags": chunk_tags})
+                else:
+                    current_chunk.append({
+                        "content": content,
+                        "tags": [element_type, file_context['file_path']]
+                    })
 
                 # Check if chunk is full and yield
                 if len(current_chunk) >= chunk_size:
@@ -369,8 +465,10 @@ def stream_parse_py(file_path, chunk_size=100):
                              "name": alias.name,
                              "asname": alias.asname
                          })
+                 
+                 content = json.dumps(import_info, ensure_ascii=False)
                  current_chunk.append({
-                     "content": json.dumps(import_info, ensure_ascii=False),
+                     "content": content,
                      "tags": ["import", file_context['file_path']]
                  })
                  if len(current_chunk) >= chunk_size:
@@ -402,59 +500,71 @@ def stream_parse_py(file_path, chunk_size=100):
 
 def stream_parse_txt(file_path, chunk_size=100):
     """
-    Streaming TXT parser with generators.
-    Attempts to split text into meaningful chunks (e.g., paragraphs).
-    Yields chunks of documents.
+    Streaming TXT parser with token overlap between chunks
     """
     try:
         with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
-            current_chunk = []
-            buffer = ""
-            for line in f:
-                buffer += line
-                # Heuristic: Assume paragraphs are separated by blank lines
-                if line.strip() == "" or len(buffer) > 8000:
-                    if buffer.strip():
-                        current_chunk.append({
-                            "content": buffer.strip(),
-                            "tags": ["txt_paragraph", file_path]
-                        })
-                        buffer = ""
-                        if len(current_chunk) >= chunk_size:
-                            yield current_chunk
-                            current_chunk = []
-                
-                # Safety net for extremely long lines
-                if len(buffer) > 10000:
-                    current_chunk.append({
-                        "content": buffer.strip()[:10000],
-                        "tags": ["txt_long_line", file_path]
-                    })
-                    buffer = buffer[10000:]
-
-            # Add the last piece if it exists
-            if buffer.strip():
-                 current_chunk.append({
-                    "content": buffer.strip(),
-                    "tags": ["txt_final", file_path]
+            # Read entire file content
+            full_content = f.read()
+        
+        if not full_content.strip():
+            return
+        
+        # Split content into overlapping chunks
+        overlapping_chunks = TokenOverlapProcessor.create_overlapping_chunks(full_content, 500)
+        
+        current_chunk = []
+        for chunk_idx, chunk_content in enumerate(overlapping_chunks):
+            if chunk_content.strip():
+                current_chunk.append({
+                    "content": chunk_content.strip(),
+                    "tags": ["txt_chunk", file_path, f"chunk_{chunk_idx}"]
                 })
-
-            # Yield any remaining items in the current chunk
-            if current_chunk:
-                yield current_chunk
-
-    except Exception as e:
-        logger.warning(f"TXT parse failed for {file_path}: {str(e)}")
-        # Fallback: read in fixed-size blocks
-        with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
-            current_chunk = []
-            while True:
-                content = f.read(8192)
-                if not content:
-                    break
-                current_chunk.append({"content": content, "tags": ["txt_fallback_block", file_path]})
+                
                 if len(current_chunk) >= chunk_size:
                     yield current_chunk
                     current_chunk = []
-            if current_chunk:
-                yield current_chunk
+        
+        # Yield any remaining items
+        if current_chunk:
+            yield current_chunk
+
+    except Exception as e:
+        logger.warning(f"TXT parse failed for {file_path}: {str(e)}")
+        # Fallback: read in fixed-size blocks with overlap
+        try:
+            with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
+                current_chunk = []
+                block_size = 8192
+                overlap_size = 512
+                previous_block = ""
+                block_idx = 0
+                
+                while True:
+                    content = f.read(block_size)
+                    if not content:
+                        break
+                    
+                    # Add overlap from previous block
+                    if previous_block:
+                        full_block = previous_block[-overlap_size:] + content
+                    else:
+                        full_block = content
+                    
+                    current_chunk.append({
+                        "content": full_block, 
+                        "tags": ["txt_fallback_block", file_path, f"block_{block_idx}"]
+                    })
+                    
+                    if len(current_chunk) >= chunk_size:
+                        yield current_chunk
+                        current_chunk = []
+                    
+                    previous_block = content
+                    block_idx += 1
+                
+                if current_chunk:
+                    yield current_chunk
+        except Exception as fallback_e:
+            logger.error(f"Fallback TXT parsing also failed for {file_path}: {fallback_e}")
+            yield [{"content": f"Failed to parse file: {file_path}", "tags": ["parse_error", file_path]}]

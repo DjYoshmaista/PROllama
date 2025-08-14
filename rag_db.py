@@ -1,29 +1,22 @@
 # rag_db.py
-import psycopg2
 import requests
-import asyncpg
 import json
 import aiohttp
-import numpy as np
-import heapq
-import torch
 import os
-from psycopg2 import sql
-from psycopg2.extras import RealDictCursor
-import tkinter as tk
 import asyncio
 import multiprocessing
 import time
 from tkinter import filedialog
-from async_loader import run_processing
+from async_loader import run_processing_with_queue_and_tracking, get_processing_status
 from config import Config
-from db import db_manager, db_cursor  # Import the fixed db_cursor function
+from db import db_manager, db_cursor
 from utils import *
 from constants import *
 import logging
 from em_cache import EmbeddingCache
 from progress_manager import SimpleProgressTracker
 from file_tracker import file_tracker
+from embedding_queue import embedding_queue
 
 # Configure logging
 logging.basicConfig(
@@ -40,7 +33,89 @@ table_name = Config.TABLE_NAME
 
 # Global embedding cache
 embedding_cache = EmbeddingCache()
+
+class EnhancedProgressTracker(SimpleProgressTracker):
+    """Enhanced progress tracker with detailed status reporting"""
+    
+    def __init__(self, description):
+        super().__init__(description)
+        self.detailed_stats = {
+            'files_processed': 0,
+            'items_queued': 0,
+            'items_completed': 0,
+            'current_file': None,
+            'stage': 'initializing',
+            'start_time': time.time()
+        }
+    
+    def update_file_progress(self, filename, stage, current, total, message):
+        """Update progress for a specific file"""
+        self.detailed_stats.update({
+            'current_file': filename,
+            'stage': stage,
+            'last_message': message
+        })
         
+        # Update main progress if we have meaningful data
+        if current > 0 and total > 0:
+            self.update(current, total, f"{stage}: {filename} - {message}")
+    
+    def update_overall_progress(self, processed, total, success, failed, items_queued):
+        """Update overall processing progress"""
+        self.detailed_stats.update({
+            'files_processed': processed,
+            'files_total': total,
+            'files_success': success,
+            'files_failed': failed,
+            'items_queued': items_queued
+        })
+        
+        progress_msg = f"Files: {processed}/{total} | Success: {success} | Failed: {failed} | Queued: {items_queued}"
+        self.update(processed, total, progress_msg)
+    
+    def update_system_stats(self, cpu_percent, memory_percent, load_avg):
+        """Update system resource statistics"""
+        self.detailed_stats.update({
+            'cpu_percent': cpu_percent,
+            'memory_percent': memory_percent,
+            'load_avg': load_avg
+        })
+    
+    def update_queue_stats(self, queue_size, active_workers):
+        """Update embedding queue statistics"""
+        self.detailed_stats.update({
+            'queue_size': queue_size,
+            'active_workers': active_workers
+        })
+    
+    def start_processing(self, total_files):
+        """Initialize processing with total file count"""
+        self.detailed_stats.update({
+            'files_total': total_files,
+            'start_time': time.time(),
+            'stage': 'processing'
+        })
+    
+    def finish_processing(self, success_count, failed_count, total_items):
+        """Finalize processing statistics"""
+        elapsed = time.time() - self.detailed_stats['start_time']
+        self.detailed_stats.update({
+            'stage': 'completed',
+            'elapsed_time': elapsed,
+            'final_success': success_count,
+            'final_failed': failed_count,
+            'total_items_processed': total_items
+        })
+        self.complete(total_items)
+    
+    def report_error(self, error_message):
+        """Report an error during processing"""
+        self.detailed_stats.update({
+            'stage': 'error',
+            'error_message': error_message
+        })
+        logger.error(f"Processing error reported: {error_message}")
+
 def init_db():
     """Initialize database with schema migration support"""
     try:
@@ -493,13 +568,102 @@ def show_file_tracker_stats():
             filename = os.path.basename(filepath)
             print(f"   {i}. {filename:<40} ({record.records_count} records)")
 
+def show_processing_status():
+    """Display current processing status"""
+    try:
+        status = get_processing_status()
+        
+        print(f"\n📈 Current Processing Status:")
+        
+        # Processing state
+        proc_state = status['processing_state']
+        print(f"   Progress: {proc_state.get('progress_percent', 0):.1f}%")
+        print(f"   Files remaining: {proc_state.get('files_remaining', 0)}")
+        print(f"   Failed files: {proc_state.get('failed_count', 0)}")
+        print(f"   Elapsed time: {proc_state.get('elapsed_time', 0):.1f}s")
+        
+        # Queue stats
+        queue_stats = status['queue_stats']
+        print(f"\n⚡ Embedding Queue:")
+        print(f"   Queue size: {queue_stats.get('queue_size', 0)} items")
+        print(f"   Memory usage: {queue_stats.get('current_memory_mb', 0):.1f}MB")
+        print(f"   Processed items: {queue_stats.get('processed_items', 0)}")
+        print(f"   Failed items: {queue_stats.get('failed_items', 0)}")
+        
+        # System stats
+        sys_mem = status.get('system_memory', 0)
+        print(f"\n💻 System:")
+        print(f"   Memory usage: {sys_mem:.1f}%")
+        
+    except Exception as e:
+        logger.error(f"Failed to get processing status: {e}")
+        print(f"Error getting processing status: {e}")
+
+def show_advanced_menu():
+    """Show advanced operations menu"""
+    while True:
+        print("\n🔧 Advanced Operations:")
+        print("1. Show processing status")
+        print("2. Force reload embedding cache")
+        print("3. Clean up file tracker")
+        print("4. Reset processing state")
+        print("5. Export processed file list")
+        print("6. Database maintenance")
+        print("7. Back to main menu")
+        
+        choice = input("Select option (1-7): ").strip()
+        
+        if choice == "1":
+            show_processing_status()
+        elif choice == "2":
+            asyncio.run(embedding_cache.load(force=True))
+            print("Embedding cache reloaded")
+        elif choice == "3":
+            missing_files = file_tracker.cleanup_missing_files()
+            if missing_files:
+                print(f"Cleaned up {len(missing_files)} missing file records")
+            else:
+                print("No missing files found")
+        elif choice == "4":
+            confirm = input("Reset all processing state? This will clear progress tracking (y/n): ").strip().lower()
+            if confirm == 'y':
+                file_tracker.force_reprocess_all()
+                print("Processing state reset. All files will be reprocessed.")
+        elif choice == "5":
+            try:
+                output_file = "processed_files_export.json"
+                stats = file_tracker.get_detailed_stats()
+                with open(output_file, 'w') as f:
+                    json.dump(stats, f, indent=2)
+                print(f"Processed file statistics exported to {output_file}")
+            except Exception as e:
+                print(f"Export failed: {e}")
+        elif choice == "6":
+            print("Running database maintenance...")
+            asyncio.run(run_maintenance())
+            print("Database maintenance completed")
+        elif choice == "7":
+            break
+        else:
+            print("Invalid option.")
+
+async def run_maintenance():
+    """Run database maintenance"""
+    try:
+        async with db_manager.get_async_connection() as conn:
+            await conn.execute(f"ANALYZE {Config.TABLE_NAME}")
+            await conn.execute(f"VACUUM ANALYZE {Config.TABLE_NAME}")
+            logger.info("Database maintenance completed")
+    except Exception as e:
+        logger.error(f"Maintenance failed: {e}")
+
 # Main menu
 async def main():
     global embedding_cache
     
     try:
         # Initialize database first
-        logger.info("Starting RAG Database Application -- Initializing...")
+        logger.info("Starting Enhanced RAG Database Application -- Initializing...")
         init_db()
     except Exception as e:
         logger.error(f"Database initialization failed: {e}")
@@ -511,28 +675,32 @@ async def main():
         print(f"CRITICAL: Embedding model {emb_mdl} not available!")
         return
 
-    from embedding_queue import embedding_queue
-    if not embedding_queue.started:
-        await embedding_queue.start_workers(concurrency=10)
-        logger.info("Starting embedding queue...")
-
-    # Show file tracker stats on startup
+    # Show startup statistics
     show_file_tracker_stats()
+    
+    # Show queue status if it was previously running
+    if os.path.exists("embedding_queue_state.json"):
+        queue_stats = embedding_queue.stats
+        if queue_stats['queue_size'] > 0:
+            print(f"\n⚡ Found existing embedding queue with {queue_stats['queue_size']} items")
+            print(f"   Memory usage: {queue_stats['current_memory_mb']:.1f}MB")
 
     while True:
-        print("\nRAG Database Menu:")
+        print("\n🚀 Enhanced RAG Database Menu:")
         print("1. Ask the inference model for information")
         print("2. Add data to the database")
         print("3. Load data from a file")
-        print("4. Load documents from folder")
+        print("4. Load documents from folder (with queue & tracking)")
         print("5. Query the database directly")
         print("6. List the full contents of the database")
         print("7. Configure embedding parameters")
         print("8. Optimize PostgreSQL Configuration")
         print("9. Show file processing statistics")
-        print("10. Clean up missing file records")
+        print("10. Advanced operations")
         print("11. Exit")
+        
         choice = input("Enter your choice (1-11): ")
+        
         if choice == "1":
             await ask_inference_async()
         elif choice == "2":
@@ -545,8 +713,8 @@ async def main():
                     from load_documents import load_file
                     print(f"Loading file: {file_path} as {file_type}")
                     
-                    # Use simple progress tracker for single file
-                    tracker = SimpleProgressTracker(f"Loading {os.path.basename(file_path)}")
+                    # Use enhanced progress tracker for single file
+                    tracker = EnhancedProgressTracker(f"Loading {os.path.basename(file_path)}")
                     tracker.update(0, 3, "Parsing file...")
                     
                     async with aiohttp.ClientSession() as session:
@@ -559,9 +727,6 @@ async def main():
                                 content = record["content"]
                                 tags = record["tags"]  # This is a list
                                 embedding = record["embedding"]
-
-                                # Serialize tags list to JSON string
-                                tags_json = json.dumps(tags)
 
                                 query = f"INSERT INTO {table_name} (content, tags, embedding) VALUES (%s, %s, %s)"
                                 cur.execute(query, (content, tags, embedding))
@@ -593,13 +758,29 @@ async def main():
                 if total_files == 0:
                     print("No supported files found in the selected folder.")
                     continue
+                
+                print(f"\n🔄 Starting enhanced processing with queue and tracking...")
+                print(f"   Total files found: {total_files}")
+                
+                # Create enhanced progress tracker
+                progress_tracker = EnhancedProgressTracker("Enhanced Processing")
+                
                 # Create a generator for the file paths
                 file_generator = generate_file_paths(folder_path)
-                print("Starting processing...")
-                total_processed = await run_processing(file_generator, total_files)
+                
+                # Run enhanced processing with queue and tracking
+                total_processed = await run_processing_with_queue_and_tracking(
+                    file_generator, 
+                    total_files, 
+                    progress_manager=progress_tracker
+                )
+                
                 # Reset cache loaded flag after bulk load
                 embedding_cache.db_loaded = False
-                print(f"\n✅ Finished! Total documents loaded: {total_processed}")
+                print(f"\n✅ Enhanced processing finished!")
+                print(f"   Files processed: {total_processed}")
+                print(f"   Check logs for detailed statistics")
+                
         elif choice == "5":
             query_db()
         elif choice == "6":
@@ -611,17 +792,17 @@ async def main():
         elif choice == "9":
             show_file_tracker_stats()
         elif choice == "10":
-            missing_files = file_tracker.cleanup_missing_files()
-            if missing_files:
-                print(f"Cleaned up {len(missing_files)} missing file records")
-            else:
-                print("No missing files found")
+            show_advanced_menu()
         elif choice == "11":
             print("Exiting...")
             # Clean up async resources
             try:
+                # Stop embedding queue if running
+                if embedding_queue.started:
+                    await embedding_queue.stop_workers()
+                    
                 await db_manager.close_pools()
-                logger.info("Cleaned up database pools")
+                logger.info("Cleaned up database pools and embedding queue")
             except Exception as e:
                 logger.error(f"Error during cleanup: {e}")
             break

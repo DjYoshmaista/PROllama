@@ -24,9 +24,6 @@ from security_utils import input_validator, SecurityError
 logger = logging.getLogger(__name__)
 DB_CONN_STRING = Config.get_db_connection_string()
 
-# Shared counters for progress tracking (multiprocessing-safe)
-shared_counters = None
-
 # Connection pool per worker process
 _worker_pool = None
 _processing_stats = {
@@ -36,13 +33,189 @@ _processing_stats = {
     'last_update': time.time()
 }
 
+class ProcessingStateManager:
+    """Manages processing state for resumable operations"""
+    
+    def __init__(self):
+        self.state_file = "processing_state.json"
+        self.current_state = {
+            'total_files': 0,
+            'processed_files': 0,
+            'failed_files': [],
+            'current_batch': 0,
+            'last_processed_file': None,
+            'processing_start_time': None,
+            'last_checkpoint': None
+        }
+        self.load_state()
+    
+    def load_state(self):
+        """Load processing state from disk"""
+        try:
+            if os.path.exists(self.state_file):
+                with open(self.state_file, 'r') as f:
+                    saved_state = json.load(f)
+                    self.current_state.update(saved_state)
+                logger.info(f"Loaded processing state: {self.current_state['processed_files']}/{self.current_state['total_files']} files processed")
+        except Exception as e:
+            logger.warning(f"Could not load processing state: {e}")
+    
+    def save_state(self):
+        """Save current processing state to disk"""
+        try:
+            self.current_state['last_checkpoint'] = time.time()
+            with open(self.state_file, 'w') as f:
+                json.dump(self.current_state, f, indent=2)
+        except Exception as e:
+            logger.error(f"Failed to save processing state: {e}")
+    
+    def start_processing(self, total_files: int):
+        """Initialize processing state"""
+        self.current_state.update({
+            'total_files': total_files,
+            'processed_files': 0,
+            'failed_files': [],
+            'current_batch': 0,
+            'processing_start_time': time.time()
+        })
+        self.save_state()
+    
+    def update_progress(self, processed_files: int, current_file: str = None):
+        """Update processing progress"""
+        self.current_state['processed_files'] = processed_files
+        if current_file:
+            self.current_state['last_processed_file'] = current_file
+        
+        # Save state every 10 files
+        if processed_files % 10 == 0:
+            self.save_state()
+    
+    def add_failed_file(self, file_path: str, error: str):
+        """Record a failed file"""
+        self.current_state['failed_files'].append({
+            'file': file_path,
+            'error': error,
+            'timestamp': time.time()
+        })
+    
+    def get_progress_info(self):
+        """Get current progress information"""
+        return {
+            'progress_percent': (self.current_state['processed_files'] / max(1, self.current_state['total_files'])) * 100,
+            'files_remaining': self.current_state['total_files'] - self.current_state['processed_files'],
+            'failed_count': len(self.current_state['failed_files']),
+            'elapsed_time': time.time() - (self.current_state['processing_start_time'] or time.time())
+        }
+
+# Global state manager
+processing_state = ProcessingStateManager()
+
 async def initialize_worker_pool():
     """Initialize connection pool for worker using centralized DB manager"""
     global _worker_pool
     if _worker_pool is None:
-        # Use the centralized database manager instead of creating separate pools
         _worker_pool = await db_manager.get_async_pool()
     return _worker_pool
+
+async def database_insert_callback(records: list):
+    """Callback function for inserting records into database"""
+    if not records:
+        return
+    
+    try:
+        pool = await initialize_worker_pool()
+        async with pool.acquire() as conn:
+            await pgvector.asyncpg.register_vector(conn)
+            
+            # Insert records in batches
+            await conn.executemany(
+                f"INSERT INTO {Config.TABLE_NAME} (content, tags, embedding) VALUES ($1, $2::text[], $3)",
+                [(r['content'], r['tags'], r['embedding']) for r in records]
+            )
+            
+            logger.debug(f"Inserted {len(records)} records into database")
+            
+    except Exception as e:
+        logger.error(f"Database insert failed: {e}")
+        raise
+
+async def process_file_with_queue(file_path, progress_callback=None):
+    """
+    Process a single file using the embedding queue system
+    """
+    file_type = os.path.splitext(file_path)[1][1:].lower()
+    processed_records = 0
+
+    def report_progress(stage, current=0, total=1, message=""):
+        """Helper function to report progress if callback is provided"""
+        if progress_callback and callable(progress_callback):
+            try:
+                progress_callback(file_path, stage, current, total, message)
+            except Exception as e:
+                logger.warning(f"Progress callback failed for {file_path}: {e}")
+
+    try:
+        # Check if file should be processed (using file tracker)
+        should_process, reason = file_tracker.should_process_file(file_path)
+        if not should_process:
+            report_progress("skipped", 1, 1, f"Skipped: {reason}")
+            logger.debug(f"Skipping {file_path}: {reason}")
+            return (file_path, True, 0)  # Return success but 0 records
+
+        report_progress("initializing", 0, 1, "Starting file processing")
+
+        # Parse file and enqueue chunks
+        chunk_count = 0
+        total_chunks_queued = 0
+        
+        import parse_documents
+        
+        async for chunk in parse_documents.stream_parse_file(file_path, file_type, Config.CHUNK_SIZES['file_processing']):
+            if not chunk:
+                continue
+                
+            chunk_count += 1
+            report_progress("parsing", chunk_count, chunk_count + 1, f"Processing chunk {chunk_count}")
+            
+            # Process each item in the chunk
+            for item_idx, item in enumerate(chunk):
+                content = item.get('content', '')
+                tags = item.get('tags', [])
+                
+                if not content.strip():
+                    continue
+                
+                # Wait if queue is getting full
+                while embedding_queue.wait_for_space():
+                    report_progress("waiting_queue", 0, 1, "Waiting for queue space...")
+                    await asyncio.sleep(0.1)
+                
+                # Enqueue item for embedding processing
+                queued = await embedding_queue.enqueue(
+                    content=content,
+                    tags=tags,
+                    file_path=file_path,
+                    chunk_index=chunk_count * 1000 + item_idx  # Unique chunk index
+                )
+                
+                if queued:
+                    total_chunks_queued += 1
+                else:
+                    logger.warning(f"Failed to queue item from {file_path}, chunk {chunk_count}")
+        
+        # Mark file as processed in tracker
+        file_tracker.mark_file_processed(file_path, total_chunks_queued)
+        
+        report_progress("queued", 1, 1, f"Queued {total_chunks_queued} items for processing")
+        logger.info(f"Queued {total_chunks_queued} items from {file_path}")
+        
+        return (file_path, True, total_chunks_queued)
+        
+    except Exception as e:
+        report_progress("error", 0, 1, f"Error: {str(e)[:100]}")
+        logger.error(f"Error processing {file_path}: {e}")
+        processing_state.add_failed_file(file_path, str(e))
+        return (file_path, False, 0)
 
 async def log_batch_metrics(conn):
     """Log metrics for monitoring embedding quality"""
@@ -64,318 +237,41 @@ async def log_batch_metrics(conn):
     except Exception as e:
         logger.warning(f"Could not log batch metrics: {e}")
 
-def init_shared_counters():
-    """Initialize shared counters for multiprocessing"""
-    global shared_counters
-    manager = multiprocessing.Manager()
-    shared_counters = manager.dict({
-        'files_processed': 0,
-        'data_pieces_created': 0,
-        'embeddings_created': 0,
-        'records_inserted': 0
-    })
-    return shared_counters
-
-def update_shared_counter(counter_name, increment=1):
-    """Update shared counter (multiprocessing-safe)"""
-    global shared_counters
-    if shared_counters is not None:
-        shared_counters[counter_name] = shared_counters.get(counter_name, 0) + increment
-
-async def process_file(file_path, progress_callback=None):
+async def run_processing_with_queue_and_tracking(file_generator, total_files, progress_manager=None):
     """
-    Process a single file with optional progress callback
-    
-    Args:
-        file_path: Path to the file to process
-        progress_callback: Optional callable that receives progress updates
-                          Signature: progress_callback(file_path, stage, current, total, message)
+    Enhanced processing pipeline with queue system and file tracking
     """
-    global _worker_pool
-    file_type = os.path.splitext(file_path)[1][1:].lower()
-    processed_records = 0
-
-    def report_progress(stage, current=0, total=1, message=""):
-        """Helper function to report progress if callback is provided"""
-        if progress_callback and callable(progress_callback):
-            try:
-                progress_callback(file_path, stage, current, total, message)
-            except Exception as e:
-                logger.warning(f"Progress callback failed for {file_path}: {e}")
-
-    # Report initialization stage
-    report_progress("initializing", 0, 1, "Setting up database connection")
-
-    if _worker_pool is None:
-        _worker_pool = await asyncpg.create_pool(
-            DB_CONN_STRING, 
-            min_size=2,
-            max_size=8,
-            timeout=180,
-            server_settings=Config.PG_OPTIMIZATION_SETTINGS
-        )
+    # Initialize processing state
+    processing_state.start_processing(total_files)
     
-    try:
-        async with _worker_pool.acquire() as conn:
-            await pgvector.asyncpg.register_vector(conn)
-            await conn.execute("SET jit = off")
-            
-            # Report connection established
-            report_progress("connected", 1, 1, "Database connection established")
-            
-            connector = aiohttp.TCPConnector(limit=50)
-            async with aiohttp.ClientSession(connector=connector) as session:
-                # Report file loading stage
-                report_progress("loading", 0, 1, "Loading and chunking file")
-                
-                chunk_generator = load_documents.load_file_chunked(
-                    file_path, file_type, session, Config.CHUNK_SIZES['embedding_batch']
-                )
-                batch_counter = 0
-                failed_embeddings = 0
-                total_chunks_processed = 0
-                
-                # Report processing start
-                report_progress("processing", 0, 1, "Starting chunk processing")
-
-                chunk_index = 0
-                async for records in chunk_generator:
-                    if not records:
-                        continue
-                    
-                    # Report chunk processing progress
-                    report_progress("processing_chunk", chunk_index, chunk_index + 1, 
-                                  f"Processing chunk {chunk_index + 1} ({len(records)} records)")
-                    
-                    chunk_index += 1
-                    
-                    for i in range(0, len(records), Config.CHUNK_SIZES['insert_batch']):
-                        chunk = records[i:i+Config.CHUNK_SIZES['insert_batch']]
-                        
-                        # Report batch insertion progress
-                        batch_num = i // Config.CHUNK_SIZES['insert_batch'] + 1
-                        total_batches = (len(records) + Config.CHUNK_SIZES['insert_batch'] - 1) // Config.CHUNK_SIZES['insert_batch']
-                        report_progress("inserting_batch", batch_num, total_batches, 
-                                      f"Inserting batch {batch_num}/{total_batches} ({len(chunk)} records)")
-                        
-                        try:
-                            # Insert tags as JSONB directly
-                            await conn.executemany(
-                                f"INSERT INTO {Config.TABLE_NAME} (content, tags, embedding) VALUES ($1, $2::text[], $3)",
-                                [(r['content'], r['tags'] if isinstance(r['tags'], list) else r['tags'], r['embedding']) for r in chunk]
-                            )
-                            processed_records += len(chunk)
-                            
-                            # Report successful batch insertion
-                            report_progress("batch_inserted", batch_num, total_batches, 
-                                          f"Successfully inserted batch {batch_num} ({processed_records} total records)")
-                            
-                        except asyncpg.exceptions.UndefinedColumnError:
-                            # Handle missing tags column
-                            report_progress("schema_migration", 0, 1, "Adding missing tags column")
-                            await conn.execute(f"ALTER TABLE {Config.TABLE_NAME} ADD COLUMN tags TEXT[] DEFAULT '[]'::text[]")
-                            
-                            await conn.executemany(
-                                f"INSERT INTO {Config.TABLE_NAME} (content, tags, embedding) VALUES ($1, $2, $3)",
-                                [(r['content'], r['tags'], r['embedding']) for r in chunk]
-                            )
-                            processed_records += len(chunk)
-                            
-                            # Report successful migration and insertion
-                            report_progress("migration_complete", 1, 1, f"Schema migrated and batch inserted ({processed_records} total records)")
-                            
-                        except Exception as e:
-                            failed_embeddings += len(chunk)
-                            logger.error(f"Insert failed: {e}")
-                            
-                            # Report batch failure
-                            report_progress("batch_failed", batch_num, total_batches, 
-                                          f"Batch {batch_num} failed: {str(e)[:100]}")
-                            
-                    total_chunks_processed += 1
-                    
-                    # Report chunk completion
-                    report_progress("chunk_complete", total_chunks_processed, total_chunks_processed, 
-                                  f"Completed chunk {total_chunks_processed} ({processed_records} total records)")
-                            
-                    if batch_counter % 100 == 0:
-                        # Report metrics logging
-                        report_progress("logging_metrics", batch_counter, batch_counter + 1, "Logging batch metrics")
-                        await log_batch_metrics(conn)
-                    batch_counter += 1
-                
-                # Report final processing results
-                if processed_records > 0 or failed_embeddings > 0:
-                    success_message = f"Processed {processed_records} records"
-                    if failed_embeddings > 0:
-                        success_message += f", failed {failed_embeddings} embeddings"
-                    
-                    report_progress("processing_complete", 1, 1, success_message)
-                    
-                    logger.info(f"Processed {processed_records} records, "
-                                f"failed {failed_embeddings} embeddings from {file_path}")
-                else:
-                    report_progress("no_records", 1, 1, "No records to process")
-
-        # Report final file completion
-        report_progress("file_complete", 1, 1, f"File processing complete: {processed_records} records")
-        
-        logger.info(f"Processed {processed_records} records from {file_path}")
-        return (file_path, processed_records > 0, processed_records)
-        
-    except Exception as e:
-        # Report error
-        error_message = f"Error processing file: {str(e)[:100]}"
-        report_progress("error", 0, 1, error_message)
-        
-        logger.error(f"Error processing {file_path}: {e}")
-        return (file_path, False, 0)
+    # Filter files that need processing using file tracker
+    logger.info("Filtering files that need processing...")
+    files_to_process, filter_stats = file_tracker.batch_filter_files(list(file_generator))
     
-async def log_batch_metrics(conn):
-    metrics = await conn.fetch(f"""
-        SELECT 
-            AVG(vector_norm(embedding)) AS avg_norm,
-            COUNT(*) FILTER (WHERE vector_norm(embedding) = 0) AS zero_vectors
-        FROM {Config.TABLE_NAME}
-    """)
-    logger.info(f"Embedding batch metrics: {dict(metrics[0])}")
-
-    del metrics
-    gc.collect()
-
-async def run_processing(file_generator, total_files):
-    """Process files from generator with resource monitoring"""
-    # Start the embedding queue workers
-    await embedding_queue.start_workers(concurrency=10)
+    logger.info(f"File filtering complete:")
+    logger.info(f"  Total files: {filter_stats.total_files}")
+    logger.info(f"  Files to process: {filter_stats.files_to_process}")
+    logger.info(f"  Files skipped: {filter_stats.files_skipped}")
+    logger.info(f"  New files: {filter_stats.new_files}")
+    logger.info(f"  Changed files: {filter_stats.size_changed + filter_stats.time_changed + filter_stats.content_changed}")
+    logger.info(f"  Already processed: {filter_stats.already_processed}")
     
-    processing_active = threading.Event()
-    processing_active.set()
+    if not files_to_process:
+        logger.info("No files need processing")
+        return 0
     
-    def monitor_resources():
-        while processing_active.is_set():
-            mem = psutil.virtual_memory()
-            cpu = psutil.cpu_percent()
-            load = os.getloadavg()
-            
-            logger.info(
-                f"RESOURCE MONITOR | CPU: {cpu}% | "
-                f"Memory: {mem.percent}% | Used: {mem.used/(1024**2):.1f}MB | "
-                f"Load: {load[0]:.1f}, {load[1]:.1f}, {load[2]:.1f}"
-            )
-            
-            # Add embedding queue stats
-            if embedding_queue.started:
-                qsize = embedding_queue.queue.qsize()
-                active_workers = sum(1 for w in embedding_queue.workers if not w.done())
-                logger.info(f"EMBEDDING QUEUE | Size: {qsize} | Active Workers: {active_workers}")
-            
-            if mem.percent >= Config.MEMORY_CLEANUP_THRESHOLD:
-                logger.warning(f"High memory usage ({mem.percent}%). Forcing garbage collection")
-                cleanup_memory()
-                mem_after = psutil.virtual_memory()
-                logger.info(f"GC freed {((mem.used - mem_after.used)/(1024**2)):.1f}MB")
-            
-            time.sleep(10)
-
-    monitor_thread = threading.Thread(target=monitor_resources, daemon=True)
-    monitor_thread.start()
-
-    success_count = 0
-    total_embeddings = 0
-    failed_files = []
+    # Start embedding queue with database callback
+    await embedding_queue.start_workers(
+        concurrency=Config.WORKER_PROCESSES,
+        insert_callback=database_insert_callback
+    )
     
-    try:
-        batch_size = 100
-        processed_count = 0
-        batch_num = 1
-
-        with tqdm(total=total_files, desc="Processing files", unit="file") as pbar:
-            while processed_count < total_files:
-                file_batch = []
-                for _ in range(min(batch_size, total_files - processed_count)):
-                    try:
-                        file_path = next(file_generator)
-                        file_batch.append(file_path)
-                    except StopIteration:
-                        break
-                
-                if not file_batch:
-                    break
-                
-                num_processes = Config.WORKER_PROCESSES
-                async with AsyncPool(processes=num_processes) as pool:
-                    tasks = [
-                        pool.apply(process_file, (file_path,))
-                        for file_path in file_batch
-                    ]
-                    
-                    for future in asyncio.as_completed(tasks):
-                        result = await future
-                        file_path, success, embeddings_count = result
-                        if success:
-                            success_count += 1
-                            total_embeddings += embeddings_count
-                        else:
-                            failed_files.append(file_path)
-                        
-                        pbar.update(1)
-                        processed_count += 1
-                        pbar.set_postfix(
-                            success=success_count, 
-                            failed=len(failed_files),
-                            embeddings=total_embeddings,
-                            mem=f"{psutil.virtual_memory().percent}%",
-                            qsize=f"{embedding_queue.queue.qsize()}"
-                        )
-                
-                del file_batch
-                gc.collect()
-                
-                mem = psutil.virtual_memory()
-                if mem.percent > 80:
-                    logger.warning("High memory pressure, running VACUUM")
-                    await run_maintenance()
-                
-                batch_num += 1
-    except Exception as e:
-        logger.error(f"Processing failed: {e}")
-    finally:
-        processing_active.clear()
-        monitor_thread.join(timeout=1.0)
-        
-        # Stop workers when processing completes
-        await embedding_queue.stop_workers()
-        
-        logger.info(f"Processed {success_count}/{total_files} files successfully")
-        logger.info(f"Generated {total_embeddings} embeddings")
-        if failed_files:
-            logger.warning(f"{len(failed_files)} files failed processing")
-            with open("failed_files.json", "w") as f:
-                json.dump(failed_files, f)
-        
-        return success_count
-
-async def run_processing_with_progress_manager(file_generator, total_files, progress_manager=None):
-    """
-    Enhanced version of run_processing that integrates with a progress manager
-    
-    Args:
-        file_generator: Generator yielding file paths
-        total_files: Total number of files to process
-        progress_manager: Progress manager instance with update methods
-    """
-    # Define progress callback function that integrates with progress manager
+    # Progress callback function
     def progress_callback(file_path, stage, current, total, message):
-        """Progress callback that forwards updates to the progress manager"""
         if progress_manager and hasattr(progress_manager, 'update_file_progress'):
             try:
-                # Extract filename for cleaner display
                 filename = os.path.basename(file_path)
-                
-                # Create detailed status message
                 status_message = f"[{stage}] {message}" if message else f"[{stage}]"
-                
-                # Forward to progress manager
                 progress_manager.update_file_progress(
                     filename=filename,
                     stage=stage,
@@ -386,9 +282,7 @@ async def run_processing_with_progress_manager(file_generator, total_files, prog
             except Exception as e:
                 logger.warning(f"Progress manager update failed: {e}")
     
-    # Start the embedding queue workers
-    await embedding_queue.start_workers(concurrency=10)
-    
+    # Resource monitoring
     processing_active = threading.Event()
     processing_active.set()
     
@@ -397,132 +291,119 @@ async def run_processing_with_progress_manager(file_generator, total_files, prog
             mem = psutil.virtual_memory()
             cpu = psutil.cpu_percent()
             load = os.getloadavg()
+            queue_stats = embedding_queue.stats
             
             logger.info(
-                f"RESOURCE MONITOR | CPU: {cpu}% | "
-                f"Memory: {mem.percent}% | Used: {mem.used/(1024**2):.1f}MB | "
-                f"Load: {load[0]:.1f}, {load[1]:.1f}, {load[2]:.1f}"
+                f"SYSTEM | CPU: {cpu}% | Memory: {mem.percent}% ({mem.used/(1024**3):.1f}GB) | "
+                f"Load: {load[0]:.1f} | Queue: {queue_stats['queue_size']} items "
+                f"({queue_stats['current_memory_mb']:.1f}MB)"
             )
             
             # Update progress manager with system stats if available
-            if progress_manager and hasattr(progress_manager, 'update_system_stats'):
+            if progress_manager:
                 try:
-                    progress_manager.update_system_stats(
-                        cpu_percent=cpu,
-                        memory_percent=mem.percent,
-                        load_avg=load[0]
-                    )
-                except Exception as e:
-                    logger.warning(f"System stats update failed: {e}")
-            
-            # Add embedding queue stats
-            if embedding_queue.started:
-                qsize = embedding_queue.queue.qsize()
-                active_workers = sum(1 for w in embedding_queue.workers if not w.done())
-                logger.info(f"EMBEDDING QUEUE | Size: {qsize} | Active Workers: {active_workers}")
-                
-                # Update progress manager with queue stats if available
-                if progress_manager and hasattr(progress_manager, 'update_queue_stats'):
-                    try:
-                        progress_manager.update_queue_stats(
-                            queue_size=qsize,
-                            active_workers=active_workers
+                    if hasattr(progress_manager, 'update_system_stats'):
+                        progress_manager.update_system_stats(
+                            cpu_percent=cpu,
+                            memory_percent=mem.percent,
+                            load_avg=load[0]
                         )
-                    except Exception as e:
-                        logger.warning(f"Queue stats update failed: {e}")
+                    if hasattr(progress_manager, 'update_queue_stats'):
+                        progress_manager.update_queue_stats(
+                            queue_size=queue_stats['queue_size'],
+                            active_workers=len([w for w in embedding_queue.workers if not w.done()]) if embedding_queue.workers else 0
+                        )
+                except Exception as e:
+                    logger.warning(f"Progress manager stats update failed: {e}")
             
+            # Memory cleanup if needed
             if mem.percent >= Config.MEMORY_CLEANUP_THRESHOLD:
-                logger.warning(f"High memory usage ({mem.percent}%). Forcing garbage collection")
+                logger.warning(f"High memory usage ({mem.percent}%). Running cleanup")
                 cleanup_memory()
-                mem_after = psutil.virtual_memory()
-                logger.info(f"GC freed {((mem.used - mem_after.used)/(1024**2)):.1f}MB")
-            
+                
             time.sleep(10)
 
     monitor_thread = threading.Thread(target=monitor_resources, daemon=True)
     monitor_thread.start()
 
     success_count = 0
-    total_embeddings = 0
+    total_items_queued = 0
     failed_files = []
     
     try:
-        batch_size = 100
+        batch_size = 50  # Process files in smaller batches
         processed_count = 0
-        batch_num = 1
 
         # Initialize progress manager if available
         if progress_manager and hasattr(progress_manager, 'start_processing'):
             try:
-                progress_manager.start_processing(total_files)
+                progress_manager.start_processing(len(files_to_process))
             except Exception as e:
                 logger.warning(f"Progress manager start failed: {e}")
 
-        with tqdm(total=total_files, desc="Processing files", unit="file") as pbar:
-            while processed_count < total_files:
-                file_batch = []
-                for _ in range(min(batch_size, total_files - processed_count)):
-                    try:
-                        file_path = next(file_generator)
-                        file_batch.append(file_path)
-                    except StopIteration:
-                        break
+        with tqdm(total=len(files_to_process), desc="Processing files", unit="file") as pbar:
+            # Process files in batches
+            for i in range(0, len(files_to_process), batch_size):
+                batch = files_to_process[i:i + batch_size]
                 
-                if not file_batch:
-                    break
-                
-                num_processes = Config.WORKER_PROCESSES
-                async with AsyncPool(processes=num_processes) as pool:
-                    # Create tasks with progress callback
-                    tasks = [
-                        pool.apply(process_file, (file_path, progress_callback))
-                        for file_path in file_batch
-                    ]
+                # Process batch sequentially to maintain file tracker order
+                for file_path in batch:
+                    result = await process_file_with_queue(file_path, progress_callback)
+                    file_path, success, items_queued = result
                     
-                    for future in asyncio.as_completed(tasks):
-                        result = await future
-                        file_path, success, embeddings_count = result
-                        if success:
-                            success_count += 1
-                            total_embeddings += embeddings_count
-                        else:
-                            failed_files.append(file_path)
-                        
-                        pbar.update(1)
-                        processed_count += 1
-                        pbar.set_postfix(
-                            success=success_count, 
-                            failed=len(failed_files),
-                            embeddings=total_embeddings,
-                            mem=f"{psutil.virtual_memory().percent}%",
-                            qsize=f"{embedding_queue.queue.qsize()}"
-                        )
-                        
-                        # Update overall progress in progress manager
-                        if progress_manager and hasattr(progress_manager, 'update_overall_progress'):
-                            try:
-                                progress_manager.update_overall_progress(
-                                    processed_count, 
-                                    total_files, 
-                                    success_count, 
-                                    len(failed_files),
-                                    total_embeddings
-                                )
-                            except Exception as e:
-                                logger.warning(f"Overall progress update failed: {e}")
+                    if success:
+                        success_count += 1
+                        total_items_queued += items_queued
+                    else:
+                        failed_files.append(file_path)
+                    
+                    processed_count += 1
+                    processing_state.update_progress(processed_count, file_path)
+                    
+                    pbar.update(1)
+                    pbar.set_postfix(
+                        success=success_count,
+                        failed=len(failed_files),
+                        queued=total_items_queued,
+                        mem=f"{psutil.virtual_memory().percent}%",
+                        qsize=embedding_queue.stats['queue_size']
+                    )
+                    
+                    # Update overall progress in progress manager
+                    if progress_manager and hasattr(progress_manager, 'update_overall_progress'):
+                        try:
+                            progress_manager.update_overall_progress(
+                                processed_count,
+                                len(files_to_process),
+                                success_count,
+                                len(failed_files),
+                                total_items_queued
+                            )
+                        except Exception as e:
+                            logger.warning(f"Overall progress update failed: {e}")
                 
-                del file_batch
-                gc.collect()
+                # Save file tracker state after each batch
+                file_tracker.save_tracker()
+                processing_state.save_state()
                 
+                # Run maintenance if memory pressure is high
                 mem = psutil.virtual_memory()
                 if mem.percent > 80:
-                    logger.warning("High memory pressure, running VACUUM")
+                    logger.warning("High memory pressure, running maintenance")
                     await run_maintenance()
                 
-                batch_num += 1
-                
+                gc.collect()
+
+        # Wait for queue to empty
+        logger.info("Waiting for embedding queue to complete processing...")
+        while embedding_queue.stats['queue_size'] > 0:
+            await asyncio.sleep(1)
+            if embedding_queue.stats['queue_size'] % 100 == 0:
+                logger.info(f"Queue items remaining: {embedding_queue.stats['queue_size']}")
+
     except Exception as e:
         logger.error(f"Processing failed: {e}")
+        processing_state.add_failed_file("SYSTEM_ERROR", str(e))
         if progress_manager and hasattr(progress_manager, 'report_error'):
             try:
                 progress_manager.report_error(str(e))
@@ -532,37 +413,52 @@ async def run_processing_with_progress_manager(file_generator, total_files, prog
         processing_active.clear()
         monitor_thread.join(timeout=1.0)
         
-        # Stop workers when processing completes
+        # Stop embedding queue workers
         await embedding_queue.stop_workers()
+        
+        # Final save of state
+        file_tracker.save_tracker()
+        processing_state.save_state()
         
         # Finalize progress manager
         if progress_manager and hasattr(progress_manager, 'finish_processing'):
             try:
-                progress_manager.finish_processing(success_count, len(failed_files), total_embeddings)
+                progress_manager.finish_processing(success_count, len(failed_files), total_items_queued)
             except Exception as e:
                 logger.warning(f"Progress manager finish failed: {e}")
         
-        logger.info(f"Processed {success_count}/{total_files} files successfully")
-        logger.info(f"Generated {total_embeddings} embeddings")
+        logger.info(f"Processing complete!")
+        logger.info(f"  Files processed: {success_count}/{len(files_to_process)}")
+        logger.info(f"  Items queued for embedding: {total_items_queued}")
+        logger.info(f"  Failed files: {len(failed_files)}")
+        
         if failed_files:
-            logger.warning(f"{len(failed_files)} files failed processing")
-            with open("failed_files.json", "w") as f:
-                json.dump(failed_files, f)
+            logger.warning(f"Failed files saved to processing_state.json")
         
         return success_count
+
+# Legacy function for backwards compatibility
+async def run_processing(file_generator, total_files):
+    """Legacy processing function - redirects to enhanced version"""
+    return await run_processing_with_queue_and_tracking(file_generator, total_files)
 
 async def run_maintenance():
     """Run periodic database maintenance"""
     conn = None
     try:
-        conn = await asyncpg.connect(DB_CONN_STRING)
-        # Analyze to update statistics
-        await conn.execute(f"ANALYZE {Config.TABLE_NAME}")
-        # Vacuum to reclaim space
-        await conn.execute(f"VACUUM (VERBOSE, ANALYZE) {Config.TABLE_NAME}")
-        logger.info("Database maintenance completed")
+        pool = await initialize_worker_pool()
+        async with pool.acquire() as conn:
+            await conn.execute(f"ANALYZE {Config.TABLE_NAME}")
+            await conn.execute(f"VACUUM (VERBOSE, ANALYZE) {Config.TABLE_NAME}")
+            logger.info("Database maintenance completed")
     except Exception as e:
         logger.error(f"Maintenance failed: {e}")
-    finally:
-        if conn:
-            await conn.close()
+
+def get_processing_status():
+    """Get current processing status"""
+    return {
+        'processing_state': processing_state.get_progress_info(),
+        'file_tracker_stats': file_tracker.get_processed_files_stats(),
+        'queue_stats': embedding_queue.stats,
+        'system_memory': psutil.virtual_memory().percent
+    }
