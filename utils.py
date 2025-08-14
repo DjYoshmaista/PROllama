@@ -6,8 +6,8 @@ import json
 from json import JSONDecodeError
 import numpy as np
 import torch
-from embedding_queue import embedding_queue
-from contextlib import contextmanager
+from embedding_queue import embedding_queue  # FIXED: Added missing import
+from contextlib import contextmanager, asynccontextmanager  # FIXED: Added asynccontextmanager
 from config import Config
 from db import db_manager
 from vector_math import batched_cosine_similarity
@@ -183,6 +183,13 @@ def db_cursor():
     """Context manager for database connections"""
     with db_manager.get_sync_cursor() as (conn, cur):
         yield (conn, cur)
+
+# FIXED: Added async database cursor context manager
+@asynccontextmanager
+async def async_db_cursor():
+    """Async context manager for database connections"""
+    async with db_manager.get_async_connection() as conn:
+        yield conn
 
 def get_document_count():
     """Get total document count from database"""

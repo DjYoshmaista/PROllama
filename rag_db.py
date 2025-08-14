@@ -17,7 +17,7 @@ import time
 from tkinter import filedialog
 from async_loader import run_processing
 from config import Config
-from db import db_manager
+from db import db_manager, db_cursor  # Import the fixed db_cursor function
 from utils import *
 from constants import *
 import logging
@@ -50,7 +50,7 @@ def init_db():
                 CREATE TABLE IF NOT EXISTS {table_name} (
                     id SERIAL PRIMARY KEY,
                     content TEXT NOT NULL,
-                    tags JSONB DEFAULT '[]'::jsonb,
+                    tags TEXT[] DEFAULT '[]'::text[],
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     embedding VECTOR(1024)
                 )
@@ -66,8 +66,7 @@ def init_db():
             """)
             if not cur.fetchone():
                 logger.info("Migrating tags column to JSONB")
-                cur.execute(f"ALTER TABLE {table_name} ADD COLUMN tags JSONB DEFAULT '[]'::jsonb")
-                conn.commit()
+                cur.execute(f"ALTER TABLE {table_name} ADD COLUMN tags TEXT[] DEFAULT '[]'::text[]")
 
             # Create index
             cur.execute(f"""
@@ -76,11 +75,10 @@ def init_db():
                 USING hnsw (embedding vector_cosine_ops)
             """)
 
-            conn.commit()
         logger.info("Database initialized successfully.")
     except Exception as e:
         logger.error(f"Database initialization failed: {str(e)}")
-        raise
+        raise Exception(f"Database initialization failed: {str(e)}")
 
 # Add data to the database
 def add_data():
@@ -101,7 +99,6 @@ def add_data():
         with db_cursor() as (conn, cur):
             query = f"INSERT INTO {table_name} (content, embedding) VALUES (%s, %s)"
             cur.execute(query, (content, embedding))
-            conn.commit()
             
         tracker.complete(1)
         print("Data added successfully.")
@@ -438,7 +435,6 @@ def configure_postgres():
                             cur.execute(f"ALTER SYSTEM SET {setting} = '{value}'")
                         except Exception as e:
                             logger.warning(f"Couldn't set {setting}: {str(e)}")
-            conn.commit()
         print("PostgreSQL configuration applied. Please restart PostgreSQL.")
     except Exception as e:
         logger.error(f"Configuration failed: {str(e)}")
@@ -500,7 +496,15 @@ def show_file_tracker_stats():
 # Main menu
 async def main():
     global embedding_cache
-    init_db()
+    
+    try:
+        # Initialize database first
+        logger.info("Starting RAG Database Application -- Initializing...")
+        init_db()
+    except Exception as e:
+        logger.error(f"Database initialization failed: {e}")
+        print(f"❌ Initialization failed: {e}")
+        return
 
     if not validate_embedding_model():
         emb_mdl = "dengcao/Qwen3-Embedding-0.6B:Q8_0"
@@ -560,13 +564,11 @@ async def main():
                                 tags_json = json.dumps(tags)
 
                                 query = f"INSERT INTO {table_name} (content, tags, embedding) VALUES (%s, %s, %s)"
-                                cur.execute(query, (content, tags_json, embedding))
+                                cur.execute(query, (content, tags, embedding))
                                 
                                 # Update progress
                                 if i % 10 == 0:
                                     tracker.update(1 + i/len(records), 3, f"Inserting record {i+1}/{len(records)}")
-                                
-                            conn.commit()
                         
                         tracker.update(2, 3, "Updating file tracker...")
                         # Mark file as processed
@@ -616,6 +618,12 @@ async def main():
                 print("No missing files found")
         elif choice == "11":
             print("Exiting...")
+            # Clean up async resources
+            try:
+                await db_manager.close_pools()
+                logger.info("Cleaned up database pools")
+            except Exception as e:
+                logger.error(f"Error during cleanup: {e}")
             break
         else:
             print("Invalid choice. Please try again.")

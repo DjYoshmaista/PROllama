@@ -1,24 +1,21 @@
 # em_cache.py
-import asyncpg
-from config import Config
-from db import DB_CONN_STRING
-import time
+import json
 import torch
 import logging
 import os
-import heapq
 import numpy as np
 import tempfile
 import shelve
 import atexit
 import shutil
-from constants import *
-from config import *
-from utils import *
 from collections import OrderedDict
-import json
+from config import Config
+from db import db_manager
+import time
+import heapq
 
 logger = logging.getLogger(__name__)
+DB_CONN_STRING = Config.get_db_connection_string()
 
 class EmbeddingCache:
     _instance = None
@@ -59,7 +56,8 @@ class EmbeddingCache:
             return True
             
         try:
-            async with db_cursor() as (conn, cur):
+            # FIXED: Use db_manager directly to avoid circular imports and get proper async connection
+            async with db_manager.get_async_connection() as conn:
                 records = await conn.fetch(
                     f"SELECT id, embedding FROM {Config.TABLE_NAME}"
                 )

@@ -1,14 +1,21 @@
-# vector_math.py
+# vector_math.py - Optimized vector operations
 import torch
 import numpy as np
 from gpu_utils import GPUMemoryManager
+from performance_optimizer import vector_optimizer, performance_profiler
 import logging
+from typing import Union, List
 
 logger = logging.getLogger(__name__)
 
-def batched_cosine_similarity(query_embedding, embeddings, batch_size=5000, use_gpu=None):
+def batched_cosine_similarity(
+    query_embedding: Union[List[float], np.ndarray, torch.Tensor], 
+    embeddings: Union[List[List[float]], np.ndarray, torch.Tensor], 
+    batch_size: int = 5000, 
+    use_gpu: bool = None
+) -> np.ndarray:
     """
-    Unified cosine similarity calculation with automatic GPU/CPU selection
+    Optimized cosine similarity calculation with automatic GPU/CPU selection
     
     Args:
         query_embedding: Query vector (list, numpy array, or tensor)
@@ -19,25 +26,29 @@ def batched_cosine_similarity(query_embedding, embeddings, batch_size=5000, use_
     Returns:
         numpy array of similarity scores
     """
-    # Convert inputs to tensors
-    if not isinstance(query_embedding, torch.Tensor):
-        query_tensor = torch.tensor(query_embedding, dtype=torch.float32)
-    else:
-        query_tensor = query_embedding.clone()
-    
-    if not isinstance(embeddings, torch.Tensor):
-        embeddings_tensor = torch.tensor(embeddings, dtype=torch.float32)
-    else:
-        embeddings_tensor = embeddings.clone()
-    
-    # Auto-detect GPU usage
-    if use_gpu is None:
-        use_gpu = torch.cuda.is_available() and len(embeddings) > 100
-    
-    if use_gpu:
-        return _gpu_batched_similarity(query_tensor, embeddings_tensor, batch_size)
-    else:
-        return _cpu_cosine_similarity(query_tensor, embeddings_tensor)
+    with performance_profiler.profile_operation("cosine_similarity"):
+        # Convert inputs to numpy arrays for consistency
+        if isinstance(query_embedding, (list, tuple)):
+            query_array = np.array(query_embedding, dtype=np.float32)
+        elif isinstance(query_embedding, torch.Tensor):
+            query_array = query_embedding.cpu().numpy().astype(np.float32)
+        else:
+            query_array = query_embedding.astype(np.float32)
+        
+        if isinstance(embeddings, (list, tuple)):
+            embeddings_array = np.array(embeddings, dtype=np.float32)
+        elif isinstance(embeddings, torch.Tensor):
+            embeddings_array = embeddings.cpu().numpy().astype(np.float32)
+        else:
+            embeddings_array = embeddings.astype(np.float32)
+        
+        # Optimize storage format
+        embeddings_array = vector_optimizer.optimize_embeddings_storage(embeddings_array)
+        
+        # Use optimized similarity calculation
+        return vector_optimizer.optimize_batch_cosine_similarity(
+            query_array, embeddings_array, batch_size, use_gpu
+        )
 
 def _gpu_batched_similarity(query_tensor, embeddings_tensor, batch_size):
     """GPU-accelerated batched similarity calculation"""

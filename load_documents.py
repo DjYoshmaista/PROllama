@@ -1,13 +1,10 @@
 # load_documents.py
-import gc
 import parse_documents
 from utils import get_embeddings_batch
 from config import Config
 from progress_manager import SimpleProgressTracker
 import os
-import json
 import logging
-import asyncio
 
 logger = logging.getLogger(__name__)
 

@@ -1,7 +1,5 @@
 # progress_tracker.py
 from async_loader import run_processing
-import multiprocessing
-import asyncio
 
 async def track_progress(file_generator, total_files):
     """Track progress of file processing with memory-efficient approach"""

@@ -4,8 +4,15 @@ import csv
 import os
 import ast
 import logging
-import ijson  # For streaming JSON parsing
 from config import Config
+
+# FIXED: Conditional import with fallback for ijson
+try:
+    import ijson  # For streaming JSON parsing
+    HAS_IJSON = True
+except ImportError:
+    HAS_IJSON = False
+    logging.warning("ijson not available, falling back to standard JSON parsing for large files")
 
 logger = logging.getLogger(__name__)
 
@@ -147,9 +154,9 @@ def stream_parse_json(file_path, chunk_size=100):
     """
     try:
         with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
-            # Handle JSON arrays using ijson for streaming
+            # FIXED: Check if ijson is available before using it
             first_char = f.read(1)
-            if first_char == '[':
+            if first_char == '[' and HAS_IJSON:
                 f.seek(0)
                 parser = ijson.parse(f)
                 current_chunk = []
@@ -184,7 +191,7 @@ def stream_parse_json(file_path, chunk_size=100):
                 if current_chunk:
                     yield current_chunk
             else:
-                # Single JSON object or scalar
+                # Single JSON object or scalar, or ijson not available
                 f.seek(0)
                 data = json.load(f)
                 # Reuse logic from non-streaming parse_json, but yield in chunks
