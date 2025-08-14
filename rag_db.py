@@ -1,3 +1,4 @@
+# rag_db.py
 import psycopg2
 import requests
 import asyncpg
@@ -14,15 +15,19 @@ import asyncio
 import multiprocessing
 import time
 from tkinter import filedialog
-from progress_tracker import track_progress
-from constants import *
+from async_loader import run_processing
+from config import Config
+from db import db_manager
 from utils import *
+from constants import *
 import logging
 from em_cache import EmbeddingCache
+from progress_manager import SimpleProgressTracker
+from file_tracker import file_tracker
 
 # Configure logging
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.WARNING,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
         logging.FileHandler("rag_db.log", encoding='utf-8'),
@@ -31,19 +36,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger()
 
-table_name = TABLE_NAME
-
-# Configuration for inference
-DEFAULT_RELEVANCE_THRESHOLD = 0.3
-DEFAULT_TOP_K = 25
-DEFAULT_VECTOR_SEARCH_LIMIT = 999999999
-MAX_CACHE_SIZE = 20000000
-CACHE_REFRESH_INTERVAL = 300
+table_name = Config.TABLE_NAME
 
 # Global embedding cache
-global embedding_cache, last_cache_refresh
 embedding_cache = EmbeddingCache()
-last_cache_refresh = 0
         
 def init_db():
     """Initialize database with schema migration support"""
@@ -81,37 +77,10 @@ def init_db():
             """)
 
             conn.commit()
-            cur.close()
-            conn.close()
         logger.info("Database initialized successfully.")
     except Exception as e:
         logger.error(f"Database initialization failed: {str(e)}")
         raise
-
-# Generate answer using Ollama
-def generate_answer(prompt):
-    try:
-        response = requests.post(
-            f"{OLLAMA_API}/generate",
-            json={"model": "qwen3:8b", "prompt": prompt},
-            stream=True,
-            timeout=120
-        )
-        response.raise_for_status()
-        full_response = ""
-        for line in response.iter_lines():
-            if line:
-                try:
-                    data = json.loads(line)
-                    full_response += data.get("response", "")
-                    if data.get("done"):
-                        break
-                except json.JSONDecodeError:
-                    logger.warning("Error decoding line from Ollama")
-        return full_response
-    except Exception as e:
-        logger.error(f"Answer generation failed: {str(e)}")
-        return "Error generating answer."
 
 # Add data to the database
 def add_data():
@@ -120,17 +89,24 @@ def add_data():
     if not content.strip():
         print("Content cannot be empty!")
         return
+    
     try:
+        # Use simple progress tracker for single operation
+        tracker = SimpleProgressTracker("Generating embedding")
+        tracker.update(0, 1, "Processing...")
+        
         embedding = get_embedding(content)
+        tracker.update(1, 1, "Complete")
+        
         with db_cursor() as (conn, cur):
-            query = f"INSERT INTO {table_name} (content, embedding) VALUES (%s, %s)",
+            query = f"INSERT INTO {table_name} (content, embedding) VALUES (%s, %s)"
             cur.execute(query, (content, embedding))
             conn.commit()
-            cur.close()
-            conn.close()
-            print("Data added successfully.")
-        # Invalidate cache
-        embedding_cache = None
+            
+        tracker.complete(1)
+        print("Data added successfully.")
+        # Reset cache loaded flag to force reload
+        embedding_cache.db_loaded = False
     except Exception as e:
         logger.error(f"Error adding data: {str(e)}")
         print("Failed to add data.")
@@ -144,8 +120,6 @@ def query_db():
             rows = cur.fetchall()
             for row in rows:
                 print(f"ID: {row[0]}, Content: {row[1][:1000]}...")
-            cur.close()
-            conn.close()
     except Exception as e:
         logger.error(f"Database query failed: {str(e)}")
         print("Failed to query database.")
@@ -159,120 +133,38 @@ def list_contents():
             rows = cur.fetchall()
             for row in rows:
                 print(f"ID: {row[0]}, Content: {row[1][:200]}...")
-            cur.close()
-            conn.close()
     except Exception as e:
         logger.error(f"Failed to list contents: {str(e)}")
         print("Failed to list database contents.")
 
-def load_embedding_cache():
-    """Load all embeddings into memory for fast GPU processing"""
-    global embedding_cache, last_cache_refresh
-    current_time = time.time()
-    
-    if embedding_cache is None or (current_time - last_cache_refresh) > CACHE_REFRESH_INTERVAL:
-        try:
-            logger.info("Loading embedding cache...")
-            with db_cursor() as (conn, cur):
-
-                # Get total count
-                query = f"SELECT COUNT(*) FROM {table_name}"
-                cur.execute(query)
-                total_docs = cur.fetchone()[0]
-                
-                if total_docs > MAX_CACHE_SIZE:
-                    logger.warning(f"Database too large for cache ({total_docs} > {MAX_CACHE_SIZE})")
-                    embedding_cache = None
-                    return False
-                
-                # Load IDs and embeddings
-                query = f"SELECT id, embedding FROM {table_name}"
-                cur.execute(query)
-                rows = cur.fetchall()
-                
-                ids = []
-                embeddings = []
-                for row in rows:
-                    doc_id, doc_embedding = row
-                    ids.append(doc_id)
-                    
-                    # Handle different embedding formats from pgvector
-                    if doc_embedding is None:
-                        logger.warning(f"Null embedding for document ID {doc_id}, skipping")
-                        continue
-                        
-                    # pgvector returns embeddings as lists, not strings
-                    if isinstance(doc_embedding, str):
-                        # Only parse if it's actually a string (shouldn't happen with pgvector)
-                        try:
-                            # Remove brackets and split by comma if it's a pgvector string format
-                            if doc_embedding.startswith('[') and doc_embedding.endswith(']'):
-                                doc_embedding = [float(x) for x in doc_embedding[1:-1].split(',')]
-                            else:
-                                doc_embedding = json.loads(doc_embedding)
-                        except (json.JSONDecodeError, ValueError) as e:
-                            logger.error(f"Failed to parse embedding for ID {doc_id}: {e}")
-                            continue
-                    elif isinstance(doc_embedding, (list, tuple)):
-                        # Already in correct format from pgvector
-                        doc_embedding = list(doc_embedding)
-                    else:
-                        # Handle numpy arrays or other array-like objects
-                        try:
-                            doc_embedding = list(doc_embedding)
-                        except Exception as e:
-                            logger.error(f"Cannot convert embedding to list for ID {doc_id}: {e}")
-                            continue
-                    
-                    embeddings.append(doc_embedding)
-                
-                if not embeddings:
-                    logger.error("No valid embeddings found in database")
-                    cur.close()
-                    conn.close()
-                    return False
-                
-                # Convert to tensor
-                embedding_tensor = torch.tensor(embeddings, dtype=torch.float32)
-                if torch.cuda.is_available():
-                    embedding_tensor = embedding_tensor.cuda()
-                
-                embedding_cache = {
-                    'ids': ids,
-                    'embeddings': embedding_tensor,
-                    'count': len(ids),
-                    'timestamp': current_time
-                }
-                last_cache_refresh = current_time
-                logger.info(f"Embedding cache loaded with {len(ids)} vectors")
-                
-                cur.close()
-                conn.close()
-            return True
-            
-        except Exception as e:
-            logger.error(f"Failed to load embedding cache: {str(e)}", exc_info=True)
-            embedding_cache = None
-            return False
-    return True
-
 async def ask_inference_async(
-    relevance_threshold=DEFAULT_RELEVANCE_THRESHOLD,
-    top_k=DEFAULT_TOP_K,
-    vector_search_limit=DEFAULT_VECTOR_SEARCH_LIMIT
+    relevance_threshold=None,
+    top_k=None,
+    vector_search_limit=None
 ):
     """Wrapper function for inference pipeline"""
+    # Use config defaults if not provided
+    relevance_threshold = relevance_threshold or Config.SEARCH_DEFAULTS['relevance_threshold']
+    top_k = top_k or Config.SEARCH_DEFAULTS['top_k'] 
+    vector_search_limit = vector_search_limit or Config.SEARCH_DEFAULTS['vector_search_limit']
+    
     question = get_user_question()
     if not question:
         return
 
+    # Use simple progress tracker for inference
+    tracker = SimpleProgressTracker("Processing query")
+    tracker.update(0, 4, "Generating question embedding...")
+    
     question_embedding = await get_question_embedding(question)
     if not question_embedding:
         return
 
+    tracker.update(1, 4, "Checking cache...")
     use_cache = handle_cache_decision()
     
-    if use_cache and embedding_cache:
+    tracker.update(2, 4, "Searching for relevant documents...")
+    if use_cache and embedding_cache.stats['memory_entries'] > 0:
         top_docs = await perform_gpu_cache_search(
             question_embedding,
             relevance_threshold,
@@ -288,28 +180,32 @@ async def ask_inference_async(
         )
     
     if not top_docs:
+        tracker.complete(0)
         return
 
+    tracker.update(3, 4, "Retrieving document contents...")
     final_docs = retrieve_document_contents(top_docs)
     if not final_docs:
+        tracker.complete(0)
         return
 
+    tracker.update(4, 4, "Generating answer...")
     generate_and_display_answer(question, final_docs)
+    tracker.complete(len(final_docs))
 
 def configure_embedding_parameters():
     """Menu for configuring embedding parameters"""
-    global DEFAULT_RELEVANCE_THRESHOLD, DEFAULT_TOP_K, DEFAULT_VECTOR_SEARCH_LIMIT
     print("\nEmbedding Configuration:")
-    print(f"1. Relevance Threshold (current: {DEFAULT_RELEVANCE_THRESHOLD:.2f})")
-    print(f"2. Top K Results (current: {DEFAULT_TOP_K})")
-    print(f"3. Vector Search Limit/Chunk Size (current: {DEFAULT_VECTOR_SEARCH_LIMIT})")
+    print(f"1. Relevance Threshold (current: {Config.SEARCH_DEFAULTS['relevance_threshold']:.2f})")
+    print(f"2. Top K Results (current: {Config.SEARCH_DEFAULTS['top_k']})")
+    print(f"3. Vector Search Limit/Chunk Size (current: {Config.SEARCH_DEFAULTS['vector_search_limit']})")
     print("4. Back to main menu")
     choice = input("Select option: ")
     if choice == "1":
         try:
             new_threshold = float(input("Enter new relevance threshold (0.0-1.0): "))
             if 0.0 <= new_threshold <= 1.0:
-                DEFAULT_RELEVANCE_THRESHOLD = new_threshold
+                Config.SEARCH_DEFAULTS['relevance_threshold'] = new_threshold
                 print("Threshold updated.")
             else:
                 print("Invalid value. Must be between 0.0 and 1.0")
@@ -319,7 +215,7 @@ def configure_embedding_parameters():
         try:
             new_top_k = int(input("Enter new Top K value: "))
             if new_top_k > 0:
-                DEFAULT_TOP_K = new_top_k
+                Config.SEARCH_DEFAULTS['top_k'] = new_top_k
                 print("Top K updated.")
             else:
                 print("Value must be positive integer.")
@@ -329,7 +225,7 @@ def configure_embedding_parameters():
         try:
             new_limit = int(input("Enter new vector search limit/chunk size: "))
             if new_limit > 0:
-                DEFAULT_VECTOR_SEARCH_LIMIT = new_limit
+                Config.SEARCH_DEFAULTS['vector_search_limit'] = new_limit
                 print("Vector search limit/chunk size updated.")
             else:
                 print("Value must be positive integer.")
@@ -339,8 +235,6 @@ def configure_embedding_parameters():
         return
     else:
         print("Invalid option.")
-
-
 
 def get_folder_path():
     """Simplified file browser"""
@@ -511,60 +405,14 @@ def validate_folder_path(folder_path):
         print(f"Error validating folder path: {e}")
         return False
 
-def list_directory_tree(folder_path, max_depth=2):
-    """List directory structure for user reference"""
-    print(f"\nDirectory structure (depth={max_depth}):")
-    
-    def print_tree(path, prefix="", depth=0):
-        if depth >= max_depth:
-            return
-            
-        try:
-            items = sorted(os.listdir(path))
-            dirs = [item for item in items if os.path.isdir(os.path.join(path, item))]
-            files = [item for item in items if os.path.isfile(os.path.join(path, item))]
-            
-            # Print directories first
-            for i, dir_name in enumerate(dirs[:5]):  # Limit to first 5 dirs
-                is_last = (i == len(dirs) - 1) and len(files) == 0
-                print(f"{prefix}{'└── ' if is_last else '├── '}{dir_name}/")
-                
-                new_prefix = prefix + ("    " if is_last else "│   ")
-                print_tree(os.path.join(path, dir_name), new_prefix, depth + 1)
-            
-            if len(dirs) > 5:
-                print(f"{prefix}├── ... ({len(dirs) - 5} more directories)")
-            
-            # Print files
-            supported_files = []
-            for file_name in files[:10]:  # Limit to first 10 files
-                ext = os.path.splitext(file_name)[1][1:].lower()
-                if ext in ["py", "txt", "csv", "json"]:
-                    supported_files.append(file_name)
-            
-            for i, file_name in enumerate(supported_files[:5]):
-                is_last = i == len(supported_files) - 1
-                print(f"{prefix}{'└── ' if is_last else '├── '}{file_name}")
-            
-            if len(supported_files) > 5:
-                print(f"{prefix}└── ... ({len(supported_files) - 5} more supported files)")
-                
-        except PermissionError:
-            print(f"{prefix}[Permission Denied]")
-    
-    print_tree(folder_path)
-
 def generate_file_paths(folder_path):
     """Generator yielding file paths one by one with progress tracking"""
-    file_count = 0
     for root, _, files in os.walk(folder_path):
         for file in files:
             file_path = os.path.join(root, file)
             ext = os.path.splitext(file_path)[1][1:].lower()
             if ext in ["py", "txt", "csv", "json"]:
-                file_count += 1
                 yield file_path
-    return file_count  # Return total count for progress tracking
 
 def count_files(folder_path):
     """Count supported files without storing paths"""
@@ -591,8 +439,6 @@ def configure_postgres():
                         except Exception as e:
                             logger.warning(f"Couldn't set {setting}: {str(e)}")
             conn.commit()
-            cur.close()
-            conn.close()
         print("PostgreSQL configuration applied. Please restart PostgreSQL.")
     except Exception as e:
         logger.error(f"Configuration failed: {str(e)}")
@@ -629,9 +475,31 @@ def validate_embedding_model():
         logger.error(f"Model validation failed: {str(e)}")
         return False
 
+def show_file_tracker_stats():
+    """Display file tracker statistics"""
+    stats = file_tracker.get_processed_files_stats()
+    print(f"\n📊 File Processing Statistics:")
+    print(f"   Total processed files: {stats['total_files']}")
+    print(f"   Total records created: {stats['total_records']}")
+    print(f"   Total file size: {stats['total_size_mb']:.2f} MB")
+    print(f"   Average records per file: {stats['avg_records_per_file']:.1f}")
+    
+    # Show recent files
+    if file_tracker.processed_files:
+        print(f"\n📁 Recently processed files (last 5):")
+        recent_files = sorted(
+            file_tracker.processed_files.items(), 
+            key=lambda x: x[1].processed_at, 
+            reverse=True
+        )[:5]
+        
+        for i, (filepath, record) in enumerate(recent_files, 1):
+            filename = os.path.basename(filepath)
+            print(f"   {i}. {filename:<40} ({record.records_count} records)")
+
 # Main menu
 async def main():
-    global embedding_cache, last_cache_refresh
+    global embedding_cache
     init_db()
 
     if not validate_embedding_model():
@@ -644,6 +512,9 @@ async def main():
         await embedding_queue.start_workers(concurrency=10)
         logger.info("Starting embedding queue...")
 
+    # Show file tracker stats on startup
+    show_file_tracker_stats()
+
     while True:
         print("\nRAG Database Menu:")
         print("1. Ask the inference model for information")
@@ -654,14 +525,12 @@ async def main():
         print("6. List the full contents of the database")
         print("7. Configure embedding parameters")
         print("8. Optimize PostgreSQL Configuration")
-        print("9. Exit")
-        choice = input("Enter your choice (1-9): ") # Updated choice number
+        print("9. Show file processing statistics")
+        print("10. Clean up missing file records")
+        print("11. Exit")
+        choice = input("Enter your choice (1-11): ")
         if choice == "1":
-            await ask_inference_async(
-                relevance_threshold=DEFAULT_RELEVANCE_THRESHOLD,
-                top_k=DEFAULT_TOP_K,
-                vector_search_limit=DEFAULT_VECTOR_SEARCH_LIMIT
-            )
+            await ask_inference_async()
         elif choice == "2":
             add_data()
         elif choice == "3":
@@ -671,11 +540,18 @@ async def main():
                 try:
                     from load_documents import load_file
                     print(f"Loading file: {file_path} as {file_type}")
+                    
+                    # Use simple progress tracker for single file
+                    tracker = SimpleProgressTracker(f"Loading {os.path.basename(file_path)}")
+                    tracker.update(0, 3, "Parsing file...")
+                    
                     async with aiohttp.ClientSession() as session:
                         records = await load_file(file_path, file_type, session)
+                    
+                    tracker.update(1, 3, "Inserting to database...")
                     if records:
                         with db_cursor() as (conn, cur):
-                            for record in records:
+                            for i, record in enumerate(records):
                                 content = record["content"]
                                 tags = record["tags"]  # This is a list
                                 embedding = record["embedding"]
@@ -683,16 +559,26 @@ async def main():
                                 # Serialize tags list to JSON string
                                 tags_json = json.dumps(tags)
 
-                                query = f"INSERT INTO {table_name} (content, tags, embedding) VALUES (%s, %s, %s)",
+                                query = f"INSERT INTO {table_name} (content, tags, embedding) VALUES (%s, %s, %s)"
                                 cur.execute(query, (content, tags_json, embedding))
                                 
+                                # Update progress
+                                if i % 10 == 0:
+                                    tracker.update(1 + i/len(records), 3, f"Inserting record {i+1}/{len(records)}")
+                                
                             conn.commit()
-                            cur.close()
-                            conn.close()
-                            print(f"Inserted {len(records)} records from file.")
-                        # Invalidate cache
-                        embedding_cache = None
+                        
+                        tracker.update(2, 3, "Updating file tracker...")
+                        # Mark file as processed
+                        file_tracker.mark_file_processed(file_path, len(records))
+                        file_tracker.save_tracker()
+                        
+                        tracker.complete(len(records))
+                        print(f"Inserted {len(records)} records from file.")
+                        # Reset cache loaded flag
+                        embedding_cache.db_loaded = False
                     else:
+                        tracker.complete(0)
                         print("No records to insert.")
                 except Exception as e:
                     logger.error(f"Error loading file: {str(e)}")
@@ -708,10 +594,10 @@ async def main():
                 # Create a generator for the file paths
                 file_generator = generate_file_paths(folder_path)
                 print("Starting processing...")
-                total_processed = await track_progress(file_generator, total_files)
-                # Invalidate cache after bulk load
-                embedding_cache = None
-                print(f"\nFinished! Total documents loaded: {total_processed}/{total_files}")
+                total_processed = await run_processing(file_generator, total_files)
+                # Reset cache loaded flag after bulk load
+                embedding_cache.db_loaded = False
+                print(f"\n✅ Finished! Total documents loaded: {total_processed}")
         elif choice == "5":
             query_db()
         elif choice == "6":
@@ -720,7 +606,15 @@ async def main():
             configure_embedding_parameters()
         elif choice == "8":
             configure_postgres()
-        elif choice == "9": # Updated exit choice
+        elif choice == "9":
+            show_file_tracker_stats()
+        elif choice == "10":
+            missing_files = file_tracker.cleanup_missing_files()
+            if missing_files:
+                print(f"Cleaned up {len(missing_files)} missing file records")
+            else:
+                print("No missing files found")
+        elif choice == "11":
             print("Exiting...")
             break
         else:

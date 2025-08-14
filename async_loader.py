@@ -16,36 +16,11 @@ from tqdm import tqdm
 import load_documents
 import pgvector.asyncpg
 from embedding_queue import embedding_queue
-from constants import *
+from config import Config
+from db import db_manager, DB_CONN_STRING
+from gpu_utils import cleanup_memory
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler("async_loader.log", encoding='utf-8'),
-        logging.StreamHandler()
-    ]
-)
-logger = logging.getLogger()
-
-DB_CONN_STRING = f"postgres://postgres:postgres@localhost/{DB_NAME}"
-
-# New constants for memory optimization
-POOL_RECYCLE_AFTER = 200  # Increased recycle threshold
-MEMORY_SAFE_CHUNK_SIZE = 100  # Increased for efficiency
-EMBEDDING_CHUNK_SIZE = 100  # Increased batch size
-INSERT_CHUNK_SIZE = 500  # Larger inserts
-MEMORY_CLEANUP_THRESHOLD = 85  # Higher threshold
-MAX_CONCURRENT_CHUNKS = 32  # Increased concurrency
-WORKER_PROCESSES = min(8, os.cpu_count())  # More worker processes
-
-# New PostgreSQL optimization parameters
-PG_OPTIMIZATION_SETTINGS = {
-    "statement_timeout": "300000",  # 5 minutes
-    "work_mem": "16MB",
-    "maintenance_work_mem": "512MB"
-}
+logger = logging.getLogger(__name__)
 
 # Connection pool per worker process
 _worker_pool = None
@@ -61,7 +36,7 @@ async def process_file(file_path):
             min_size=2,
             max_size=8,
             timeout=180,
-            server_settings=PG_OPTIMIZATION_SETTINGS
+            server_settings=Config.PG_OPTIMIZATION_SETTINGS
         )
     
     try:
@@ -72,30 +47,30 @@ async def process_file(file_path):
             connector = aiohttp.TCPConnector(limit=50)
             async with aiohttp.ClientSession(connector=connector) as session:
                 chunk_generator = load_documents.load_file_chunked(
-                    file_path, file_type, session, EMBEDDING_CHUNK_SIZE
+                    file_path, file_type, session, Config.CHUNK_SIZES['embedding_batch']
                 )
                 batch_counter = 0
-                failed_embeddings = 0   # Track embedding failures
+                failed_embeddings = 0
 
                 async for records in chunk_generator:
                     if not records:
                         continue
                     
-                    for i in range(0, len(records), INSERT_CHUNK_SIZE):
-                        chunk = records[i:i+INSERT_CHUNK_SIZE]
+                    for i in range(0, len(records), Config.CHUNK_SIZES['insert_batch']):
+                        chunk = records[i:i+Config.CHUNK_SIZES['insert_batch']]
                         try:
                             # Insert tags as JSONB directly
                             await conn.executemany(
-                                f"INSERT INTO {TABLE_NAME} (content, tags, embedding) VALUES ($1, $2::jsonb, $3)",
-                                [(r[0], json.dumps(r[1]) if isinstance(r[1], list) else r[1], r[2]) for r in chunk]
+                                f"INSERT INTO {Config.TABLE_NAME} (content, tags, embedding) VALUES ($1, $2::jsonb, $3)",
+                                [(r['content'], json.dumps(r['tags']) if isinstance(r['tags'], list) else r['tags'], r['embedding']) for r in chunk]
                             )
                             processed_records += len(chunk)
                         except asyncpg.exceptions.UndefinedColumnError:
                             # Handle missing tags column
-                            await conn.execute(f"ALTER TABLE {TABLE_NAME} ADD COLUMN tags JSONB DEFAULT '[]'::jsonb")
+                            await conn.execute(f"ALTER TABLE {Config.TABLE_NAME} ADD COLUMN tags JSONB DEFAULT '[]'::jsonb")
                             await conn.executemany(
-                                f"INSERT INTO {TABLE_NAME} (content, tags, embedding) VALUES ($1, $2, $3)",
-                                [(r[0], r[1], r[2]) for r in chunk]
+                                f"INSERT INTO {Config.TABLE_NAME} (content, tags, embedding) VALUES ($1, $2, $3)",
+                                [(r['content'], r['tags'], r['embedding']) for r in chunk]
                             )
                             processed_records += len(chunk)
                         except Exception as e:
@@ -108,7 +83,7 @@ async def process_file(file_path):
                 
                 # Log results with failure count
                 if processed_records > 0 or failed_embeddings > 0:
-                    logger.info(f"Processed {processed_records} recrods, "
+                    logger.info(f"Processed {processed_records} records, "
                                 f"failed {failed_embeddings} embeddings from {file_path}")
 
         logger.info(f"Processed {processed_records} records from {file_path}")
@@ -122,7 +97,7 @@ async def log_batch_metrics(conn):
         SELECT 
             AVG(vector_norm(embedding)) AS avg_norm,
             COUNT(*) FILTER (WHERE vector_norm(embedding) = 0) AS zero_vectors
-        FROM {TABLE_NAME}
+        FROM {Config.TABLE_NAME}
     """)
     logger.info(f"Embedding batch metrics: {dict(metrics[0])}")
 
@@ -155,9 +130,9 @@ async def run_processing(file_generator, total_files):
                 active_workers = sum(1 for w in embedding_queue.workers if not w.done())
                 logger.info(f"EMBEDDING QUEUE | Size: {qsize} | Active Workers: {active_workers}")
             
-            if mem.percent >= MEMORY_CLEANUP_THRESHOLD:
+            if mem.percent >= Config.MEMORY_CLEANUP_THRESHOLD:
                 logger.warning(f"High memory usage ({mem.percent}%). Forcing garbage collection")
-                gc.collect()
+                cleanup_memory()
                 mem_after = psutil.virtual_memory()
                 logger.info(f"GC freed {((mem.used - mem_after.used)/(1024**2)):.1f}MB")
             
@@ -188,7 +163,7 @@ async def run_processing(file_generator, total_files):
                 if not file_batch:
                     break
                 
-                num_processes = WORKER_PROCESSES
+                num_processes = Config.WORKER_PROCESSES
                 async with AsyncPool(processes=num_processes) as pool:
                     tasks = [
                         pool.apply(process_file, (file_path,))
@@ -211,7 +186,7 @@ async def run_processing(file_generator, total_files):
                             failed=len(failed_files),
                             embeddings=total_embeddings,
                             mem=f"{psutil.virtual_memory().percent}%",
-                            qsize=f"{embedding_queue.queue.qsize()}"  # Show queue size
+                            qsize=f"{embedding_queue.queue.qsize()}"
                         )
                 
                 del file_batch
@@ -247,9 +222,9 @@ async def run_maintenance():
     try:
         conn = await asyncpg.connect(DB_CONN_STRING)
         # Analyze to update statistics
-        await conn.execute(f"ANALYZE {TABLE_NAME}")
+        await conn.execute(f"ANALYZE {Config.TABLE_NAME}")
         # Vacuum to reclaim space
-        await conn.execute(f"VACUUM (VERBOSE, ANALYZE) {TABLE_NAME}")
+        await conn.execute(f"VACUUM (VERBOSE, ANALYZE) {Config.TABLE_NAME}")
         logger.info("Database maintenance completed")
     except Exception as e:
         logger.error(f"Maintenance failed: {e}")

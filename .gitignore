@@ -1,2 +1,7 @@
 /*.log
 /.env
+__pycache__/
+**/__pycache__/
+.env
+*.log
+*.json

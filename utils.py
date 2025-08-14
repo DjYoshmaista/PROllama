@@ -1,25 +1,21 @@
 # utils.py
 import asyncio
 import logging
-import psycopg2
 import heapq
 import json
 from json import JSONDecodeError
-import inspect
 import numpy as np
 import torch
 from embedding_queue import embedding_queue
 from contextlib import contextmanager
-from psycopg2.extras import RealDictCursor
-from constants import *
+from config import Config
+from db import db_manager
+from vector_math import batched_cosine_similarity
+from gpu_utils import cleanup_memory
+import inspect
 
-MAX_CONCURRENT_REQUESTS = 200
-EMBEDDING_DIMENSION = 1024
-OLLAMA_API = "http://localhost:11434/api"
-logger = logging.getLogger()
-l_pre = f"{inspect.currentframe().f_code.co_name}-{inspect.currentframe().f_lineno}::"
-embedding_semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
-table_name = TABLE_NAME
+logger = logging.getLogger(__name__)
+table_name = Config.TABLE_NAME
 
 # Helper Functions
 def get_user_question():
@@ -37,41 +33,20 @@ async def get_question_embedding(question):
     return embedding
 
 def handle_cache_decision():
-    """Determine if embedding cache should be used"""
+    """Simplified cache decision logic"""
     from em_cache import EmbeddingCache
     cache = EmbeddingCache()
     
-    # Check if cache has content
-    has_content = cache.stats['memory_entries'] > 0 or cache.stats['disk_entries'] > 0
+    if cache.stats['memory_entries'] > 0 or cache.stats['disk_entries'] > 0:
+        choice = input("Use available embedding cache? (Y/n): ").lower()
+        return choice != 'n'
     
-    if not has_content:
-        choice = input("Cache embeddings for faster processing? (y/N): ").lower()
-        if choice == 'y':
-            # Load embeddings into cache
-            cache.load()
-            if not cache.stats['memory_entries'] and not cache.stats['disk_entries']:
-                try:
-                    with db_cursor() as (conn, cur):
-                        for record in cur.fetchall():
-                            doc_id = record['id']
-                            embedding = record['embedding']
-                            if embedding and len(embedding) == EMBEDDING_DIMENSION:
-                                cache.set(doc_id, embedding)
-                        cur.close()
-                        conn.close()
-                    logger.info("Embeddings loaded into cache")
-                    cached = True
-                except Exception as e:
-                    logger.error(f"Failed to load embeddings into cache: {e}")
-                    cached = False
-            return cached
-        return False
-    
-    choice = input("Use available embedding cache? (Y/n): ").lower()
-    if choice == 'n':
-        logger.info("User opted out of cache")
-        return False
-    return True
+    choice = input("Cache embeddings for faster processing? (y/N): ").lower()
+    if choice == 'y':
+        # Load embeddings into cache
+        asyncio.create_task(cache.load())
+        return True
+    return False
 
 async def perform_gpu_cache_search(question_embedding, threshold, top_k):
     """Search using pre-loaded GPU embeddings"""
@@ -93,20 +68,21 @@ async def perform_gpu_cache_search(question_embedding, threshold, top_k):
         logger.warning("No embeddings found in cache memory")
         return None
     
-    # Convert to tensor and move to GPU
-    embeddings_tensor = torch.stack(all_embeddings).cuda()
-    
-    # Calculate similarities
-    similarities = gpu_cosine_similarity(question_embedding.cuda(), embeddings_tensor)
+    # Use unified similarity calculation
+    similarities = batched_cosine_similarity(
+        question_embedding, 
+        all_embeddings, 
+        use_gpu=True
+    )
     
     # Process results
-    valid_indices = torch.where(similarities >= threshold)[0]
+    valid_indices = np.where(similarities >= threshold)[0]
     if len(valid_indices) == 0:
         print("No documents passed threshold.")
         return None
 
     # Get top-k indices
-    sorted_indices = torch.argsort(similarities[valid_indices], descending=True)
+    sorted_indices = np.argsort(similarities[valid_indices])[::-1]
     top_indices = valid_indices[sorted_indices][:top_k]
 
     # Prepare results
@@ -120,10 +96,6 @@ async def perform_gpu_cache_search(question_embedding, threshold, top_k):
         })
 
     logger.info(f"Found {len(top_docs)} GPU matches")
-    
-    # Cleanup
-    del embeddings_tensor, similarities
-    cleanup_gpu()
     return top_docs
 
 def perform_chunked_database_search(question_embedding, threshold, top_k, chunk_size):
@@ -205,49 +177,12 @@ Context (ranked by relevance):
     for doc in final_docs:
         print(f"ID {doc['id']} | Cosine Similarity: {doc['cosine_similarity']:.4f}")
 
-def gpu_cosine_similarity(query_embedding, embeddings_tensor):
-    """Compute cosine similarity using GPU acceleration"""
-    # Convert query to tensor
-    query_tensor = torch.tensor(query_embedding, dtype=torch.float32)
-    if torch.cuda.is_available() and embeddings_tensor.is_cuda:
-        query_tensor = query_tensor.cuda()
-    
-    # Ensure query is the right shape [1, dim] for matrix multiplication
-    if query_tensor.dim() == 1:
-        query_tensor = query_tensor.unsqueeze(0)  # Shape: [1, dim]
-    
-    # Normalize vectors
-    query_norm = torch.nn.functional.normalize(query_tensor, p=2, dim=1)  # Shape: [1, dim]
-    embeddings_norm = torch.nn.functional.normalize(embeddings_tensor, p=2, dim=1)  # Shape: [N, dim]
-    
-    # Compute cosine similarity via matrix multiplication
-    # [1, dim] @ [N, dim].T = [1, N]
-    cos_sim = torch.mm(query_norm, embeddings_norm.t())
-    
-    # Squeeze to remove the extra dimension and convert to numpy
-    # Always move to CPU before converting to numpy
-    return cos_sim.squeeze().cpu().numpy()
-
 # Database Utilities
 @contextmanager
 def db_cursor():
     """Context manager for database connections"""
-    conn = cur = None
-    try:
-        conn = psycopg2.connect(
-            dbname=DB_NAME,
-            user=DB_USER,
-            password=DB_PASSWORD,
-            host=DB_HOST,
-            connect_timeout=30
-        )
-        cur = conn.cursor(cursor_factory=RealDictCursor)
+    with db_manager.get_sync_cursor() as (conn, cur):
         yield (conn, cur)
-    finally:
-        if cur:
-            cur.close()
-        if conn:
-            conn.close()
 
 def get_document_count():
     """Get total document count from database"""
@@ -272,28 +207,20 @@ def fetch_embedding_chunk(cursor, offset, chunk_size):
 
 # Similarity Calculation
 def calculate_chunk_similarities(question_embedding, chunk_embeddings):
-    """Calculate similarities for chunk with GPU fallback"""
+    """Calculate similarities for chunk using unified function"""
     if not chunk_embeddings:
         return None
-        
-    if torch.cuda.is_available() and len(chunk_embeddings) > 100:
-        try:
-            db_tensor = torch.tensor(chunk_embeddings, dtype=torch.float32).cuda()
-            similarities = gpu_cosine_similarity(question_embedding, db_tensor)
-            cleanup_gpu([db_tensor])
-            return similarities
-        except Exception as e:
-            logger.warning(f"GPU failed: {e}")
     
-    return np.array([
-        VectorMath.cosine_similarity(question_embedding, emb)
-        for emb in chunk_embeddings
-    ])
+    return batched_cosine_similarity(
+        question_embedding, 
+        chunk_embeddings,
+        use_gpu=len(chunk_embeddings) > 100
+    )
 
 # Result Processing
 def update_top_k_heap(heap, similarities, doc_ids, threshold, top_k):
     """Update top-k heap with new similarities"""
-    if not similarities:
+    if similarities is None:
         return
         
     for i, doc_id in enumerate(doc_ids):
@@ -335,64 +262,6 @@ def log_progress(processed, total, chunk_size=100):
     if processed % (chunk_size * 10) == 0 or processed >= total:
         logger.info(f"Processed {processed}/{total} documents")
 
-
-def cleanup_gpu(objects):
-    """Cleanup GPU objects and memory"""
-    for obj in objects:
-        del obj
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-
-# Memory cleanup
-def cleanup_memory():
-    # Force garbage collection and clear GPU cache if necessary
-    import gc
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-    logger.info("Memory cleanup performed")
-    return
-
-# Vector math utilities
-class VectorMath:
-    @staticmethod
-    def cosine_similarity(a, b):
-        """Compute cosine similarity between vectors"""
-        if isinstance(a, torch.Tensor):
-            a = a.cpu().numpy()
-        if isinstance(b, torch.Tensor):
-            b = b.cpu().numpy()
-            
-        dot = np.dot(a, b)
-        norm_a = np.linalg.norm(a)
-        norm_b = np.linalg.norm(b)
-        return dot / (norm_a * norm_b) if norm_a and norm_b else 0
-
-    @staticmethod
-    def euclidean_distance(a, b):
-        """Compute Euclidean distance between vectors"""
-        if isinstance(a, torch.Tensor):
-            a = a.cpu().numpy()
-        if isinstance(b, torch.Tensor):
-            b = b.cpu().numpy()
-        return np.linalg.norm(np.array(a) - np.array(b))
-
-    @staticmethod
-    def batched_similarity(query, db_vectors):
-        """Optimized batch similarity calculation"""
-        if not isinstance(query, torch.Tensor):
-            query = torch.tensor(query, dtype=torch.float32)
-        if not isinstance(db_vectors, torch.Tensor):
-            db_vectors = torch.tensor(db_vectors, dtype=torch.float32)
-            
-        if torch.cuda.is_available():
-            query = query.cuda()
-            db_vectors = db_vectors.cuda()
-            
-        query_norm = torch.nn.functional.normalize(query.unsqueeze(0), p=2, dim=1)
-        db_norm = torch.nn.functional.normalize(db_vectors, p=2, dim=1)
-        return torch.mm(query_norm, db_norm.t()).squeeze().cpu().numpy()
-
 async def get_embeddings_batch(session, texts):
     """Batch process embeddings using centralized queue"""
     if not texts:
@@ -412,3 +281,31 @@ def get_embedding(text):
         return loop.run_until_complete(embedding_queue.enqueue(text))
     finally:
         loop.close()
+
+def generate_answer(prompt):
+    """Generate answer using Ollama (moved from rag_db.py for consistency)"""
+    import requests
+    from constants import OLLAMA_API
+    
+    try:
+        response = requests.post(
+            f"{OLLAMA_API}/generate",
+            json={"model": "qwen3:8b", "prompt": prompt},
+            stream=True,
+            timeout=120
+        )
+        response.raise_for_status()
+        full_response = ""
+        for line in response.iter_lines():
+            if line:
+                try:
+                    data = json.loads(line)
+                    full_response += data.get("response", "")
+                    if data.get("done"):
+                        break
+                except json.JSONDecodeError:
+                    logger.warning("Error decoding line from Ollama")
+        return full_response
+    except Exception as e:
+        logger.error(f"Answer generation failed: {str(e)}")
+        return "Error generating answer."

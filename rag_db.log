@@ -1,0 +1,8 @@
+2025-08-13 22:48:37,066 - ERROR - Model validation failed: name 'OLLAMA_API' is not defined
+2025-08-13 22:52:53,935 - WARNING - GUI file browser not available: no display name and no $DISPLAY environment variable
+2025-08-13 22:53:20,350 - ERROR - Cache load failed: 'coroutine' object does not support the asynchronous context manager protocol
+Traceback (most recent call last):
+  File "/home/yosh/repos/RAGdb/em_cache.py", line 59, in load
+    async with asyncpg.connect(DB_CONN_STRING) as conn:
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+TypeError: 'coroutine' object does not support the asynchronous context manager protocol

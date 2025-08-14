@@ -1,6 +1,7 @@
-# embedding_cache.py
+# em_cache.py
 import asyncpg
-from constants import *
+from config import Config
+from db import DB_CONN_STRING
 import time
 import torch
 import logging
@@ -11,6 +12,9 @@ import tempfile
 import shelve
 import atexit
 import shutil
+from constants import *
+from config import *
+from utils import *
 from collections import OrderedDict
 import json
 
@@ -23,15 +27,19 @@ class EmbeddingCache:
     def __new__(cls):
         if cls._instance is None:
             cls._instance = super().__new__(cls)
-            # Initialize only once
-            cls._instance._initialize()
         return cls._instance
+    
+    def __init__(self):
+        if not hasattr(self, '_initialized'):
+            self._initialize()
+            self._initialized = True
     
     def _initialize(self):
         """Initialize cache structures and setup cleanup"""
         # In-memory cache (OrderedDict: key -> (embedding, byte_size))
         self.memory_cache = OrderedDict()
         self.total_memory_bytes = 0
+        self.db_loaded = False  # Track if DB embeddings are loaded
         
         # Disk cache setup
         self.disk_cache_dir = tempfile.mkdtemp(prefix="embedding_cache_")
@@ -46,35 +54,39 @@ class EmbeddingCache:
     
     async def load(self, force=False):
         """Load embeddings from database into cache"""
-        from tqdm import tqdm
+        if self.db_loaded and not force:
+            logger.info("Embeddings already loaded, skipping")
+            return True
+            
         try:
-            async with asyncpg.connect(DB_CONN_STRING) as conn:
-                with tqdm(postfix={"Loading": "embeddings"}, unit="embeddings") as pbar:
-                    records = await conn.fetch(
-                        f"SELECT id, embedding FROM {TABLE_NAME}"
-                    )
+            async with db_cursor() as (conn, cur):
+                records = await conn.fetch(
+                    f"SELECT id, embedding FROM {Config.TABLE_NAME}"
+                )
                 
-                    for record in records:
-                        doc_id = record['id']
-                        embedding = record['embedding']
-                        
-                        # Handle different embedding formats
-                        if isinstance(embedding, str):
-                            try:
-                                embedding = json.loads(embedding)
-                            except json.JSONDecodeError:
-                                # Handle pgvector array format
-                                if embedding.startswith('[') and embedding.endswith(']'):
-                                    embedding = [
-                                        float(x) 
-                                        for x in embedding[1:-1].split(',')
-                                    ]
-                        
-                        # Add to cache
-                        await self.add(doc_id, embedding)
-                        pbar.update(1)
+                loaded_count = 0
+                for record in records:
+                    doc_id = record['id']
+                    embedding = record['embedding']
                     
-                logger.info(f"Loaded {len(records)} embeddings into cache")
+                    # Handle different embedding formats
+                    if isinstance(embedding, str):
+                        try:
+                            embedding = json.loads(embedding)
+                        except json.JSONDecodeError:
+                            # Handle pgvector array format
+                            if embedding.startswith('[') and embedding.endswith(']'):
+                                embedding = [
+                                    float(x) 
+                                    for x in embedding[1:-1].split(',')
+                                ]
+                    
+                    # Add to cache
+                    await self.add(doc_id, embedding)
+                    loaded_count += 1
+                
+                self.db_loaded = True
+                logger.info(f"Loaded {loaded_count} embeddings into cache")
                 return True
         except Exception as e:
             logger.error(f"Cache load failed: {e}", exc_info=True)
@@ -178,14 +190,16 @@ class EmbeddingCache:
     def cleanup(self):
         """Clean up resources on exit"""
         # Close disk cache
-        self.disk_cache.close()
+        if hasattr(self, 'disk_cache'):
+            self.disk_cache.close()
         
         # Remove temporary directory
-        try:
-            shutil.rmtree(self.disk_cache_dir)
-            logger.info("Cleaned up disk cache directory")
-        except Exception as e:
-            logger.error(f"Error cleaning cache directory: {e}")
+        if hasattr(self, 'disk_cache_dir'):
+            try:
+                shutil.rmtree(self.disk_cache_dir)
+                logger.info("Cleaned up disk cache directory")
+            except Exception as e:
+                logger.error(f"Error cleaning cache directory: {e}")
         
         # Clear GPU cache
         if torch.cuda.is_available():
@@ -204,5 +218,6 @@ class EmbeddingCache:
             "memory_entries": len(self.memory_cache),
             "disk_entries": len(self.disk_cache),
             "memory_usage": self.memory_usage,
-            "unique_embeddings": len(self.embedding_signatures)
+            "unique_embeddings": len(self.embedding_signatures),
+            "db_loaded": self.db_loaded
         }

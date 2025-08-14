@@ -5,13 +5,15 @@ import os
 import ast
 import logging
 import ijson  # For streaming JSON parsing
+from config import Config
 
-logger = logging.getLogger()
-MAX_CHUNK_SIZE = 1000  # Maximum records per chunk for streaming
+logger = logging.getLogger(__name__)
 
 # --- Wrapper function ---
-def stream_parse_file(file_path, file_type=None, chunk_size=100):
+def stream_parse_file(file_path, file_type=None, chunk_size=None):
     """Unified streaming parser"""
+    chunk_size = chunk_size or Config.CHUNK_SIZES['file_processing']
+    
     if not os.path.exists(file_path) or os.path.getsize(file_path) == 0:
         return
 
@@ -81,8 +83,6 @@ def stream_parse_csv(file_path, chunk_size=100):
                     processed_headers.append(clean_h)
             else:
                 # Determine number of columns from the first data row
-                # Need to peek or handle carefully
-                # Let's read the first data line to get column count
                 try:
                     # Use a temporary reader to peek
                     f_temp = open(file_path, 'r', encoding='utf-8', errors='replace')
@@ -179,12 +179,8 @@ def stream_parse_json(file_path, chunk_size=100):
                                 current_chunk = []
                     elif in_object and event == 'map_key':
                         key = value
-                    elif in_object and event in ['string', 'number', 'boolean', 'null']: # Handle null
-                         # ijson might represent null as None
+                    elif in_object and event in ['string', 'number', 'boolean', 'null']:
                          current_object[key] = value
-                    # Handle nested arrays/objects? ijson handles nesting,
-                    # but this simple logic captures top-level object keys only.
-                    # For items within arrays or nested objects, keys won't be top-level tags here.
                 if current_chunk:
                     yield current_chunk
             else:
@@ -201,8 +197,6 @@ def stream_parse_json(file_path, chunk_size=100):
                             item_tags = base_tags.copy()
                             if isinstance(item, dict):
                                 item_tags.extend([str(k) for k in item.keys()])
-                            # elif isinstance(item, (list, str, int, float, bool)) or item is None:
-                            #     item_tags.append(type(item).__name__)
                             records_to_yield.append({"content": content, "tags": item_tags})
                         except Exception as item_e:
                             logger.warning(f"Error serializing item in JSON array {file_path}: {item_e}")
@@ -217,7 +211,6 @@ def stream_parse_json(file_path, chunk_size=100):
                     yield [{"content": content, "tags": tags}]
                 else: # Scalar
                     content = json.dumps(data, ensure_ascii=False)
-                    # tags = base_tags.copy() + [type(data).__name__]
                     tags = base_tags.copy()
                     yield [{"content": content, "tags": tags}]
     except Exception as e:
@@ -237,11 +230,8 @@ def stream_parse_py(file_path, chunk_size=100):
         with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
             source_code = f.read()
 
-        # Get the relative path for context
-        # You might want to pass the base directory if needed for absolute pathing
-        # relative_path = os.path.relpath(file_path, start=some_base_directory)
         file_context = {
-            "file_path": file_path, # Or relative_path
+            "file_path": file_path,
             "file_name": os.path.basename(file_path)
         }
 
@@ -254,25 +244,16 @@ def stream_parse_py(file_path, chunk_size=100):
         def get_source_segment(node):
             """Get the source code segment for a node."""
             try:
-                # This requires the source code and line numbers to be available
-                # It's a bit tricky with just the AST node, but we can try
-                # A more robust way is to use ast.get_source_segment if available (Python 3.8+)
-                # For older versions, we can approximate or just use node type/name
                 if hasattr(ast, 'get_source_segment'):
                     return ast.get_source_segment(source_code, node)
                 else:
                     # Fallback: reconstruct or use basic info
                     if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-                        # Approximate: function/class signature line
                         lines = source_code.splitlines()
                         if 1 <= node.lineno <= len(lines):
-                            # Get the line and maybe one more for multi-line signatures?
-                            # This is simplistic.
                             sig_line = lines[node.lineno - 1] # lineno is 1-based
-                            # Try to capture basic indentation
                             indent = ""
                             if sig_line.startswith((' ', '\t')):
-                                 # Find the first non-whitespace character
                                  for char in sig_line:
                                      if char in (' ', '\t'):
                                          indent += char
@@ -306,21 +287,21 @@ def stream_parse_py(file_path, chunk_size=100):
 
             element_info = None
             source_segment = get_source_segment(node)
-            source_lines = source_code.splitlines() # For indentation
+            source_lines = source_code.splitlines()
 
             if isinstance(node, ast.Module):
                 # The module itself represents the file
                 element_info = {
                     "type": "module",
-                    "name": "__main__", # Or file_context['file_name']?
+                    "name": "__main__",
                     "full_name": file_context['file_path'],
-                    "parent_path": [], # Module is the root
-                    "source_segment": source_segment, # Might be the whole file or a summary
+                    "parent_path": [],
+                    "source_segment": source_segment,
                     "line_number": 1,
-                    "indentation": "", # Module level
+                    "indentation": "",
                     "docstring": ast.get_docstring(node) if hasattr(ast, 'get_docstring') else None
                 }
-                parent_stack.append("__main__") # Push module name
+                parent_stack.append("__main__")
 
             elif isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
                 element_type = "class" if isinstance(node, ast.ClassDef) else ("async_function" if isinstance(node, ast.AsyncFunctionDef) else "function")
@@ -332,18 +313,18 @@ def stream_parse_py(file_path, chunk_size=100):
                 element_info = {
                     "type": element_type,
                     "name": element_name,
-                    "full_name": ".".join(parent_stack + [element_name]), # e.g., module.ClassName.method
-                    "parent_path": list(parent_stack), # Copy the current stack
+                    "full_name": ".".join(parent_stack + [element_name]),
+                    "parent_path": list(parent_stack),
                     "source_segment": source_segment,
                     "line_number": getattr(node, 'lineno', -1),
-                    "indentation": indent_str, # Store indentation string
+                    "indentation": indent_str,
                     "docstring": ast.get_docstring(node) if hasattr(ast, 'get_docstring') else None
                 }
 
                 # Add to chunk
                 current_chunk.append({
-                    "content": json.dumps(element_info, ensure_ascii=False), # Store structured data
-                    "tags": [element_type, file_context['file_path']] # Tag with type and file
+                    "content": json.dumps(element_info, ensure_ascii=False),
+                    "tags": [element_type, file_context['file_path']]
                 })
 
                 # Check if chunk is full and yield
@@ -355,18 +336,15 @@ def stream_parse_py(file_path, chunk_size=100):
                 parent_stack.append(element_name)
                 # Process children (methods inside class, nested functions etc.)
                 for child_node in ast.iter_child_nodes(node):
-                     # Only process relevant child nodes that might be definitions
-                     # We primarily care about nested classes/functions
                      if isinstance(child_node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-                         yield from process_node(child_node) # Recurse and yield from sub-results
-                parent_stack.pop() # Pop after processing children
+                         yield from process_node(child_node)
+                parent_stack.pop()
 
             # Add logic for other important nodes if needed (e.g., imports for context)
             elif isinstance(node, (ast.Import, ast.ImportFrom)):
-                 # Example: Capture imports for context
                  import_info = {
                      "type": "import",
-                     "names": [], # List of imported names/as names
+                     "names": [],
                      "parent_path": list(parent_stack),
                      "line_number": getattr(node, 'lineno', -1),
                      "source_segment": source_segment
@@ -384,7 +362,6 @@ def stream_parse_py(file_path, chunk_size=100):
                              "name": alias.name,
                              "asname": alias.asname
                          })
-                 # Add import info to chunk if desired
                  current_chunk.append({
                      "content": json.dumps(import_info, ensure_ascii=False),
                      "tags": ["import", file_context['file_path']]
@@ -394,9 +371,7 @@ def stream_parse_py(file_path, chunk_size=100):
                      current_chunk = []
 
         # Start processing from the root (Module)
-        # Add the module info first
-        # Note: The recursive process_node for Module will add it and manage the stack
-        yield from process_node(tree) # Start the recursive processing
+        yield from process_node(tree)
 
         # Yield any remaining items in the current chunk after traversal
         if current_chunk:
@@ -406,7 +381,7 @@ def stream_parse_py(file_path, chunk_size=100):
         logger.warning(f"Python syntax error in {file_path}: {se}")
         # Fallback: Treat as text
         with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
-             content = f.read(1000000) # Limit size
+             content = f.read(1000000)
              yield [{"content": content, "tags": ["py_syntax_error", file_path]}]
     except FileNotFoundError:
         logger.warning(f"Python file not found: {file_path}")
@@ -415,32 +390,8 @@ def stream_parse_py(file_path, chunk_size=100):
         logger.warning(f"Python parse failed for {file_path}: {str(e)}", exc_info=True)
         # Fallback: treat as text
         with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
-            content = f.read(1000000) # Limit size
+            content = f.read(1000000)
             yield [{"content": content, "tags": ["py_parse_fallback", file_path]}]
-
-def parse_file(file_path, file_type):
-    """Legacy function for non-streaming parsing. Returns all data at once."""
-    try:
-        if not os.path.exists(file_path):
-            return []
-        if os.path.getsize(file_path) == 0:
-            return []
-        # Delegate to stream parser and flatten the first chunk
-        parser = stream_parse_file(file_path, default_type=file_type, chunk_size=MAX_CHUNK_SIZE)
-        first_chunk = next(parser, [])
-        # If there are more chunks, concatenate them (though this breaks streaming benefit)
-        # For full compatibility, we might need to consume the entire generator
-        all_data = list(first_chunk)
-        try:
-            while True:
-                next_chunk = next(parser)
-                all_data.extend(next_chunk)
-        except StopIteration:
-            pass
-        return all_data
-    except Exception as e:
-        logger.error(f"Parse error ({file_path}): {e}")
-        return []
 
 def stream_parse_txt(file_path, chunk_size=100):
     """
@@ -451,37 +402,34 @@ def stream_parse_txt(file_path, chunk_size=100):
     try:
         with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
             current_chunk = []
-            # Simple paragraph splitting logic
-            # You can adjust this delimiter or logic as needed
-            # For example, splitting by double newlines for paragraphs
             buffer = ""
             for line in f:
                 buffer += line
                 # Heuristic: Assume paragraphs are separated by blank lines
-                # Or, if a line is very long, treat it as a chunk
-                if line.strip() == "" or len(buffer) > 8000: # Empty line or buffer full
-                    if buffer.strip(): # If buffer has content
+                if line.strip() == "" or len(buffer) > 8000:
+                    if buffer.strip():
                         current_chunk.append({
-                            "content": buffer.strip(), # Remove leading/trailing whitespace
-                            "tags": ["txt_paragraph"]
-                            })
+                            "content": buffer.strip(),
+                            "tags": ["txt_paragraph", file_path]
+                        })
                         buffer = ""
                         if len(current_chunk) >= chunk_size:
                             yield current_chunk
                             current_chunk = []
-                # Optional: Handle very long lines that don't get broken by paragraphs
-                if len(buffer) > 10000: # Safety net for extremely long lines
+                
+                # Safety net for extremely long lines
+                if len(buffer) > 10000:
                     current_chunk.append({
-                        "content": buffer.strip()[:10000], # Truncate if necessary
-                        "tags": ["txt_long_line"]
+                        "content": buffer.strip()[:10000],
+                        "tags": ["txt_long_line", file_path]
                     })
-                    buffer = buffer[10000:] # Keep the rest in buffer
+                    buffer = buffer[10000:]
 
             # Add the last piece if it exists
             if buffer.strip():
                  current_chunk.append({
                     "content": buffer.strip(),
-                    "tags": ["txt_final"]
+                    "tags": ["txt_final", file_path]
                 })
 
             # Yield any remaining items in the current chunk
@@ -494,10 +442,10 @@ def stream_parse_txt(file_path, chunk_size=100):
         with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
             current_chunk = []
             while True:
-                content = f.read(8192) # Read 8KB blocks
+                content = f.read(8192)
                 if not content:
                     break
-                current_chunk.append({"content": content, "tags": ["txt_fallback_block"]})
+                current_chunk.append({"content": content, "tags": ["txt_fallback_block", file_path]})
                 if len(current_chunk) >= chunk_size:
                     yield current_chunk
                     current_chunk = []

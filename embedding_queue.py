@@ -5,11 +5,10 @@ import json
 import logging
 import random
 import time
+from config import Config
 from constants import *
 
-OLLAMA_API = "http://localhost:11434/api"
-EMBEDDING_DIMENSION = EMB_DIM
-logger = logging.getLogger()
+logger = logging.getLogger(__name__)
 
 def is_zero_vector(vector):
     """Check if vector contains only zeros"""
@@ -76,8 +75,8 @@ class EmbeddingQueue:
                         if not embedding:
                             logger.error(f"Unexpected response format: {data}")
                             raise ValueError("Unexpected response format")
-                        if len(embedding) != EMBEDDING_DIMENSION:
-                            logger.error(f"Invalid dimension: {len(embedding)} (expected {EMBEDDING_DIMENSION})")
+                        if len(embedding) != Config.EMBEDDING_DIM:
+                            logger.error(f"Invalid dimension: {len(embedding)} (expected {Config.EMBEDDING_DIM})")
                             raise ValueError(f"Invalid dimension: {len(embedding)}")
                         if is_zero_vector(embedding):
                             logger.error("Zero vector generated")
