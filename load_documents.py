@@ -1,6 +1,6 @@
-# load_documents.py
+# load_documents.py - Fixed version with corrected async iteration
 import parse_documents
-from utils import get_embeddings_batch
+from embedding_service import get_embeddings_batch  # FIXED: Import from embedding_service instead of utils
 from config import Config
 from progress_manager import SimpleProgressTracker
 import os
@@ -22,7 +22,8 @@ async def load_file(file_path, file_type, session):
     chunk_count = 0
     
     try:
-        async for chunk in load_file_chunked(file_path, file_type, session):
+        # FIXED: Use regular for loop since load_file_chunked returns a sync generator
+        for chunk in load_file_chunked(file_path, file_type, session):
             records.extend(chunk)
             chunk_count += 1
             tracker.update(chunk_count, chunk_count + 1, f"Processed {len(records)} records")
@@ -42,7 +43,8 @@ async def process_chunk(chunk, file_path, session):
     contents = [item["content"] for item in valid_data]
     tags_list = [item.get("tags", []) for item in valid_data]
     
-    embeddings = await get_embeddings_batch(session, contents)
+    # FIXED: Use embedding_service instead of utils
+    embeddings = await get_embeddings_batch(contents)
     
     return [
         {"content": contents[j], "tags": tags_list[j], "embedding": embedding}
@@ -50,14 +52,34 @@ async def process_chunk(chunk, file_path, session):
         if embedding is not None and len(embedding) == Config.EMBEDDING_DIM
     ]
 
-async def load_file_chunked(file_path, file_type, session, chunk_size=None):
-    """Streaming file loader"""
+def load_file_chunked(file_path, file_type, session, chunk_size=None):
+    """
+    Streaming file loader - FIXED: Now returns a sync generator
+    NOTE: This function is NOT async because parse_documents.stream_parse_file 
+    returns a sync generator, not an async generator
+    """
     chunk_size = chunk_size or Config.CHUNK_SIZES['memory_safe']
     
     if os.path.getsize(file_path) == 0:
         return
         
     for records in parse_documents.stream_parse_file(file_path, file_type, chunk_size):
+        # Process each chunk synchronously for now
+        yield records
+
+async def load_file_chunked_async(file_path, file_type, session, chunk_size=None):
+    """
+    Async wrapper for streaming file loader that processes embeddings
+    This version actually generates embeddings for each chunk
+    """
+    chunk_size = chunk_size or Config.CHUNK_SIZES['memory_safe']
+    
+    if os.path.getsize(file_path) == 0:
+        return
+        
+    # Use the sync generator from parse_documents
+    for records in parse_documents.stream_parse_file(file_path, file_type, chunk_size):
+        # Process the chunk to add embeddings
         processed = await process_chunk(records, file_path, session)
         if processed:
             yield processed

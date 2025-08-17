@@ -1,16 +1,17 @@
-# utils.py
+# utils.py - Solution 1: Removed circular dependency
 import asyncio
 import logging
 import heapq
 import json
 from json import JSONDecodeError
 import numpy as np
-from embedding_queue import embedding_queue
+import torch
 from contextlib import contextmanager, asynccontextmanager
 from config import Config
 from db import db_manager
 from vector_math import batched_cosine_similarity
 from gpu_utils import cleanup_memory
+import inspect
 
 logger = logging.getLogger(__name__)
 table_name = Config.TABLE_NAME
@@ -24,8 +25,10 @@ def get_user_question():
     return question
 
 async def get_question_embedding(question):
-    """Generate embedding for question"""
-    embedding = await get_embedding_async(question)
+    """Generate embedding for question using embedding service"""
+    # Import here to avoid circular import
+    from embedding_service import get_single_embedding
+    embedding = await get_single_embedding(question)
     if not embedding:
         print("Failed to generate embedding for question.")
     return embedding
@@ -182,7 +185,6 @@ def db_cursor():
     with db_manager.get_sync_cursor() as (conn, cur):
         yield (conn, cur)
 
-# FIXED: Added async database cursor context manager
 @asynccontextmanager
 async def async_db_cursor():
     """Async context manager for database connections"""
@@ -267,28 +269,8 @@ def log_progress(processed, total, chunk_size=100):
     if processed % (chunk_size * 10) == 0 or processed >= total:
         logger.info(f"Processed {processed}/{total} documents")
 
-async def get_embeddings_batch(session, texts):
-    """Batch process embeddings using centralized queue"""
-    if not texts:
-        return []
-    if not embedding_queue.started:
-        await embedding_queue.start_workers(concurrency=10)
-    return await asyncio.gather(*[embedding_queue.enqueue(text) for text in texts])
-
-async def get_embedding_async(text):
-    return await embedding_queue.enqueue(text)
-
-def get_embedding(text):
-    """Synchronous wrapper for async embedding"""
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    try:
-        return loop.run_until_complete(embedding_queue.enqueue(text))
-    finally:
-        loop.close()
-
 def generate_answer(prompt):
-    """Generate answer using Ollama (moved from rag_db.py for consistency)"""
+    """Generate answer using Ollama"""
     import requests
     from constants import OLLAMA_API
     

@@ -17,6 +17,47 @@ from em_cache import EmbeddingCache
 from progress_manager import SimpleProgressTracker
 from file_tracker import file_tracker
 from embedding_queue import embedding_queue
+from debug_logging_setup import setup_debug_logging
+
+os.environ["OLLAMA_NUM_PARALLEL"] = "4"
+from ollama import embed
+
+# ENABLE DEBUG LOGGING FOR EMBEDDING ISSUES
+"""
+def setup_debug_logging():
+    # Set up DEBUG logging specifically for embedding-related modules
+    debug_formatter = logging.Formatter(
+        '%(asctime)s - %(name)s - %(levelname)s - %(funcName)s:%(lineno)d - %(message)s'
+    )
+    
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.DEBUG)
+    console_handler.setFormatter(debug_formatter)
+    
+    debug_file_handler = logging.FileHandler("embedding_debug.log", mode='w', encoding='utf-8')
+    debug_file_handler.setLevel(logging.DEBUG)
+    debug_file_handler.setFormatter(debug_formatter)
+    
+    embedding_loggers = [
+        'embedding_queue',
+        'async_loader', 
+        'embedding_service',
+        'load_documents',
+        'parse_documents'
+    ]
+    
+    for logger_name in embedding_loggers:
+        logger = logging.getLogger(logger_name)
+        logger.setLevel(logging.DEBUG)
+        logger.addHandler(console_handler)
+        logger.addHandler(debug_file_handler)
+        logger.propagate = False
+    
+    print("DEBUG logging enabled for embedding modules")
+
+# Enable debug logging
+setup_debug_logging()
+"""
 
 # Configure logging
 logging.basicConfig(
@@ -28,6 +69,7 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger()
+# setup_debug_logging()
 
 table_name = Config.TABLE_NAME
 
@@ -168,7 +210,7 @@ def add_data():
         tracker = SimpleProgressTracker("Generating embedding")
         tracker.update(0, 1, "Processing...")
         
-        embedding = get_embedding(content)
+        embedding = embed(model=EMBEDDING_MODEL, input=content)
         tracker.update(1, 1, "Complete")
         
         with db_cursor() as (conn, cur):
@@ -237,19 +279,10 @@ async def ask_inference_async(
     
     tracker.update(2, 4, "Searching for relevant documents...")
     if use_cache and embedding_cache.stats['memory_entries'] > 0:
-        top_docs = await perform_gpu_cache_search(
-            question_embedding,
-            relevance_threshold,
-            top_k
-        )
+        top_docs = await perform_gpu_cache_search(question_embedding, relevance_threshold, top_k)
     else:
         CHUNK_SIZE = min(vector_search_limit, 500000)
-        top_docs = perform_chunked_database_search(
-            question_embedding,
-            relevance_threshold,
-            top_k,
-            CHUNK_SIZE
-        )
+        top_docs = perform_chunked_database_search(question_embedding, relevance_threshold, top_k, CHUNK_SIZE)
     
     if not top_docs:
         tracker.complete(0)
@@ -662,7 +695,6 @@ async def main():
     global embedding_cache
     
     try:
-        # Initialize database first
         logger.info("Starting Enhanced RAG Database Application -- Initializing...")
         init_db()
     except Exception as e:
@@ -677,13 +709,6 @@ async def main():
 
     # Show startup statistics
     show_file_tracker_stats()
-    
-    # Show queue status if it was previously running
-    if os.path.exists("embedding_queue_state.json"):
-        queue_stats = embedding_queue.stats
-        if queue_stats['queue_size'] > 0:
-            print(f"\n⚡ Found existing embedding queue with {queue_stats['queue_size']} items")
-            print(f"   Memory usage: {queue_stats['current_memory_mb']:.1f}MB")
 
     while True:
         print("\n🚀 Enhanced RAG Database Menu:")
@@ -694,12 +719,11 @@ async def main():
         print("5. Query the database directly")
         print("6. List the full contents of the database")
         print("7. Configure embedding parameters")
-        print("8. Optimize PostgreSQL Configuration")
-        print("9. Show file processing statistics")
-        print("10. Advanced operations")
-        print("11. Exit")
+        print("8. Show file processing statistics")
+        print("9. Test embedding system")
+        print("10. Exit")
         
-        choice = input("Enter your choice (1-11): ")
+        choice = input("Enter your choice (1-10): ")
         
         if choice == "1":
             await ask_inference_async()
@@ -713,7 +737,6 @@ async def main():
                     from load_documents import load_file
                     print(f"Loading file: {file_path} as {file_type}")
                     
-                    # Use enhanced progress tracker for single file
                     tracker = EnhancedProgressTracker(f"Loading {os.path.basename(file_path)}")
                     tracker.update(0, 3, "Parsing file...")
                     
@@ -725,24 +748,21 @@ async def main():
                         with db_cursor() as (conn, cur):
                             for i, record in enumerate(records):
                                 content = record["content"]
-                                tags = record["tags"]  # This is a list
+                                tags = record["tags"]
                                 embedding = record["embedding"]
 
                                 query = f"INSERT INTO {table_name} (content, tags, embedding) VALUES (%s, %s, %s)"
                                 cur.execute(query, (content, tags, embedding))
                                 
-                                # Update progress
                                 if i % 10 == 0:
                                     tracker.update(1 + i/len(records), 3, f"Inserting record {i+1}/{len(records)}")
                         
                         tracker.update(2, 3, "Updating file tracker...")
-                        # Mark file as processed
                         file_tracker.mark_file_processed(file_path, len(records))
                         file_tracker.save_tracker()
                         
                         tracker.complete(len(records))
                         print(f"Inserted {len(records)} records from file.")
-                        # Reset cache loaded flag
                         embedding_cache.db_loaded = False
                     else:
                         tracker.complete(0)
@@ -753,7 +773,6 @@ async def main():
         elif choice == "4":
             folder_path = browse_files()
             if folder_path:
-                # Get total count while generating paths
                 total_files = count_files(folder_path)
                 if total_files == 0:
                     print("No supported files found in the selected folder.")
@@ -762,20 +781,16 @@ async def main():
                 print(f"\n🔄 Starting enhanced processing with queue and tracking...")
                 print(f"   Total files found: {total_files}")
                 
-                # Create enhanced progress tracker
                 progress_tracker = EnhancedProgressTracker("Enhanced Processing")
-                
-                # Create a generator for the file paths
                 file_generator = generate_file_paths(folder_path)
                 
-                # Run enhanced processing with queue and tracking
+                # FIXED: Use the correct function with progress manager
                 total_processed = await run_processing_with_queue_and_tracking(
                     file_generator, 
                     total_files, 
                     progress_manager=progress_tracker
                 )
                 
-                # Reset cache loaded flag after bulk load
                 embedding_cache.db_loaded = False
                 print(f"\n✅ Enhanced processing finished!")
                 print(f"   Files processed: {total_processed}")
@@ -788,26 +803,92 @@ async def main():
         elif choice == "7":
             configure_embedding_parameters()
         elif choice == "8":
-            configure_postgres()
-        elif choice == "9":
             show_file_tracker_stats()
+        elif choice == "9":
+            await test_embedding_system()
         elif choice == "10":
-            show_advanced_menu()
-        elif choice == "11":
             print("Exiting...")
-            # Clean up async resources
             try:
-                # Stop embedding queue if running
-                if embedding_queue.started:
-                    await embedding_queue.stop_workers()
-                    
                 await db_manager.close_pools()
-                logger.info("Cleaned up database pools and embedding queue")
+                logger.info("Cleaned up database pools")
             except Exception as e:
                 logger.error(f"Error during cleanup: {e}")
             break
         else:
             print("Invalid choice. Please try again.")
+
+async def test_embedding_system():
+    """Test the embedding system end-to-end"""
+    print("\n🧪 Testing Embedding System...")
+    
+    try:
+        # Test 1: API connectivity
+        print("1. Testing Ollama API connectivity...")
+        import aiohttp
+        async with aiohttp.ClientSession() as session:
+            async with session.get(f"{OLLAMA_API}/api/tags", timeout=5) as response:
+                if response.status == 200:
+                    print("   ✅ API connectivity: SUCCESS")
+                else:
+                    print(f"   ❌ API connectivity: FAILED (status {response.status})")
+                    return
+        
+        # Test 2: Embedding generation
+        print("2. Testing embedding generation...")
+        from embedding_service import get_single_embedding
+        test_text = "This is a test sentence for embedding generation."
+        embedding = await get_single_embedding(test_text)
+        
+        if embedding and len(embedding) == Config.EMBEDDING_DIM:
+            print(f"   ✅ Embedding generation: SUCCESS (dimension: {len(embedding)})")
+        else:
+            print(f"   ❌ Embedding generation: FAILED")
+            return
+        
+        # Test 3: Database insertion
+        print("3. Testing database insertion...")
+        try:
+            with db_cursor() as (conn, cur):
+                query = f"INSERT INTO {table_name} (content, tags, embedding) VALUES (%s, %s, %s)"
+                cur.execute(query, (test_text, ["test"], embedding))
+                print("   ✅ Database insertion: SUCCESS")
+        except Exception as e:
+            print(f"   ❌ Database insertion: FAILED ({e})")
+            return
+        
+        # Test 4: Queue system
+        print("4. Testing embedding queue...")
+        from embedding_queue import embedding_queue
+        from async_loader import database_insert_callback
+        
+        if not embedding_queue.started:
+            await embedding_queue.start_workers(concurrency=2, insert_callback=database_insert_callback)
+        
+        # Queue a test item
+        test_content = "Another test for the queue system."
+        queued = await embedding_queue.enqueue_for_embedding(
+            content=test_content,
+            tags=["queue_test"],
+            file_path="test_file.txt",
+            chunk_index=1
+        )
+        
+        if queued:
+            print("   ✅ Queue system: Item queued successfully")
+            
+            # Wait a bit for processing
+            await asyncio.sleep(2)
+            
+            queue_stats = embedding_queue.stats
+            print(f"   📊 Queue stats: {queue_stats['processed_items']} processed, {queue_stats['failed_items']} failed")
+        else:
+            print("   ❌ Queue system: Failed to queue item")
+        
+        print("\n🎉 Embedding system test completed!")
+        
+    except Exception as e:
+        print(f"\n❌ Test failed with error: {e}")
+        logger.error(f"Embedding system test failed: {e}", exc_info=True)
 
 if __name__ == "__main__":
     multiprocessing.set_start_method('spawn', force=True)
