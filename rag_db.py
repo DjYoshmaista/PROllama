@@ -23,7 +23,6 @@ os.environ["OLLAMA_NUM_PARALLEL"] = "4"
 from ollama import embed
 
 # ENABLE DEBUG LOGGING FOR EMBEDDING ISSUES
-"""
 def setup_debug_logging():
     # Set up DEBUG logging specifically for embedding-related modules
     debug_formatter = logging.Formatter(
@@ -54,10 +53,6 @@ def setup_debug_logging():
         logger.propagate = False
     
     print("DEBUG logging enabled for embedding modules")
-
-# Enable debug logging
-setup_debug_logging()
-"""
 
 # Configure logging
 logging.basicConfig(

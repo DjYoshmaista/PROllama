@@ -151,93 +151,128 @@ class EmbeddingQueue:
             logger.debug(f"Dequeued batch of {len(batch)} items, freed {batch_memory / (1024**2):.1f}MB")
         
         return batch
-    
+        
     async def fetch_embedding(self, text: str) -> Optional[List[float]]:
-        """Fetch embedding for a single text - FIXED VERSION"""
+        """Fetch embedding for a single text - FINAL FIXED VERSION"""
         logger.debug(f"fetch_embedding() called for text length: {len(text)}")
         
-        if not self.session:
-            logger.error("HTTP session not initialized!")
-            return None
-            
-        max_retries = 3  # Reduced from 5 for faster failure
+        max_retries = 3
         for attempt in range(max_retries):
             logger.debug(f"Embedding attempt {attempt + 1}/{max_retries}")
             try:
-                # FIXED: Use correct endpoint - just /embed since OLLAMA_API already includes /api
-                api_url = f"{OLLAMA_API}/embed"  # NOT /api/embed because OLLAMA_API = "http://localhost:11434/api"
-                logger.debug(f"Making API call to: {api_url}")
+                # FIXED: Use synchronous Ollama embed call directly
+                logger.debug(f"Making Ollama embed call")
                 logger.debug(f"Model: {EMBEDDING_MODEL}")
                 logger.debug(f"Text preview: {text[:100]}...")
                 
-                # FIXED: Add more aggressive timeout and connection handling
-                timeout = aiohttp.ClientTimeout(total=15, connect=5)  # Much shorter timeout
+                # Call Ollama embed function directly (synchronous)
+                response = embed(model=EMBEDDING_MODEL, input=text)
+                logger.debug(f"Ollama embed response received")
+                logger.debug(f"Response type: {type(response)}")
+                logger.debug(f"Response str representation: {str(response)}")
                 
-                async with embed(model=EMBEDDING_MODEL, input=text) as response:
-                    logger.debug(f"API response status: {response.status}")
+                # FINAL FIX: The Ollama response object has embeddings as an attribute
+                # From the logs we can see the response contains embeddings=[[-0.035149314, ...]]
+                # We need to access this directly as response.embeddings[0]
+                
+                embedding = None
+                
+                try:
+                    # Method 1: Direct attribute access (most likely to work)
+                    embeddings_list = getattr(response, 'embeddings', None)
+                    logger.debug(f"embeddings attribute type: {type(embeddings_list)}")
+                    logger.debug(f"embeddings attribute value: {embeddings_list is not None}")
                     
-                    if response.status == 200:
-                        try:
-                            data = await response.json()
-                            logger.debug(f"API response keys: {list(data.keys())}")
-                            
-                            # FIXED: Handle both response formats
-                            embedding = None
-                            if "embedding" in data:
-                                embedding = data["embedding"]
-                            elif "embeddings" in data and data["embeddings"]:
-                                embedding = data["embeddings"][0]
-                            
-                            if not embedding:
-                                logger.error(f"No embedding in response: {data}")
-                                raise ValueError("No embedding in response")
-                            
-                            logger.debug(f"Embedding received - dimension: {len(embedding)}")
-                            
-                            if len(embedding) != Config.EMBEDDING_DIM:
-                                logger.error(f"Invalid dimension: {len(embedding)} (expected {Config.EMBEDDING_DIM})")
-                                raise ValueError(f"Invalid dimension: {len(embedding)}")
-                            
-                            if is_zero_vector(embedding):
-                                logger.error("Zero vector generated")
-                                raise ValueError("Zero vector generated")
-                            
-                            logger.debug("Embedding successfully generated")
-                            return embedding
-                            
-                        except json.JSONDecodeError as e:
-                            logger.error(f"JSON decode error: {e}")
-                            error_text = await response.text()
-                            logger.error(f"Response text: {error_text[:500]}")
-                            raise
+                    if embeddings_list is not None and len(embeddings_list) > 0:
+                        embedding = embeddings_list[0]
+                        logger.debug(f"✓ Successfully extracted embedding via getattr - dimension: {len(embedding)}")
                     else:
-                        error = await response.text()
-                        logger.error(f"API error {response.status}: {error}")
+                        logger.debug("embeddings attribute is None or empty")
                         
-                        # Don't retry on 4xx errors
-                        if 400 <= response.status < 500:
-                            raise Exception(f"Client error {response.status}: {error}")
-                        
-                        raise Exception(f"Server error {response.status}: {error}")
-                        
-            except asyncio.TimeoutError:
-                logger.warning(f"Timeout on attempt {attempt+1}")
-                if attempt < max_retries - 1:
-                    wait_time = 2 ** attempt  # Exponential backoff
-                    logger.debug(f"Waiting {wait_time} seconds before retry")
-                    await asyncio.sleep(wait_time)
-                    continue
-                logger.error(f"Embedding failed after {max_retries} timeout attempts")
-                raise
+                except Exception as attr_error:
+                    logger.debug(f"getattr method failed: {attr_error}")
                 
-            except aiohttp.ClientError as e:
-                logger.warning(f"Client error on attempt {attempt+1}: {e}")
-                if attempt < max_retries - 1:
-                    wait_time = 2 ** attempt
-                    await asyncio.sleep(wait_time)
-                    continue
-                raise
+                # Method 2: Try direct dot notation access
+                if embedding is None:
+                    try:
+                        if hasattr(response, 'embeddings'):
+                            embeddings_list = response.embeddings
+                            logger.debug(f"Direct access embeddings type: {type(embeddings_list)}")
+                            if embeddings_list and len(embeddings_list) > 0:
+                                embedding = embeddings_list[0]
+                                logger.debug(f"✓ Successfully extracted embedding via direct access - dimension: {len(embedding)}")
+                    except Exception as direct_error:
+                        logger.debug(f"Direct access method failed: {direct_error}")
                 
+                # Method 3: Try alternative attribute names
+                if embedding is None:
+                    try:
+                        # Try singular 'embedding' attribute
+                        if hasattr(response, 'embedding'):
+                            embedding = response.embedding
+                            logger.debug(f"✓ Successfully extracted via embedding attribute - dimension: {len(embedding)}")
+                    except Exception as singular_error:
+                        logger.debug(f"Singular embedding access failed: {singular_error}")
+                
+                # Method 4: Inspect all attributes and find embeddings
+                if embedding is None:
+                    try:
+                        all_attrs = dir(response)
+                        embedding_attrs = [attr for attr in all_attrs if 'embed' in attr.lower()]
+                        logger.debug(f"All embedding-related attributes: {embedding_attrs}")
+                        
+                        for attr in embedding_attrs:
+                            try:
+                                attr_value = getattr(response, attr)
+                                logger.debug(f"Attribute {attr}: type={type(attr_value)}, is_list={isinstance(attr_value, list)}")
+                                if isinstance(attr_value, list) and len(attr_value) > 0:
+                                    potential_embedding = attr_value[0] if isinstance(attr_value[0], list) else attr_value
+                                    if isinstance(potential_embedding, list) and len(potential_embedding) == Config.EMBEDDING_DIM:
+                                        embedding = potential_embedding
+                                        logger.debug(f"✓ Found embedding via attribute {attr} - dimension: {len(embedding)}")
+                                        break
+                            except Exception as inspect_error:
+                                logger.debug(f"Failed to inspect attribute {attr}: {inspect_error}")
+                                
+                    except Exception as inspect_all_error:
+                        logger.debug(f"Attribute inspection failed: {inspect_all_error}")
+                
+                # If we still don't have an embedding, this is a critical error
+                if embedding is None:
+                    logger.error(f"CRITICAL: Could not extract embedding from response")
+                    logger.error(f"Response object details:")
+                    logger.error(f"  Type: {type(response)}")
+                    logger.error(f"  String representation: {str(response)}")
+                    logger.error(f"  Dir: {[attr for attr in dir(response) if not attr.startswith('_')]}")
+                    
+                    # Try to get more information about the embeddings attribute specifically
+                    try:
+                        embeddings_attr = getattr(response, 'embeddings', 'NOT_FOUND')
+                        logger.error(f"  embeddings attribute: {embeddings_attr}")
+                        logger.error(f"  embeddings type: {type(embeddings_attr)}")
+                        if hasattr(embeddings_attr, '__len__'):
+                            logger.error(f"  embeddings length: {len(embeddings_attr)}")
+                    except Exception as debug_error:
+                        logger.error(f"  Error inspecting embeddings: {debug_error}")
+                    
+                    raise ValueError("Could not extract embedding from Ollama response")
+                
+                # Validate the extracted embedding
+                if not isinstance(embedding, (list, tuple)):
+                    logger.error(f"Embedding is not a list/tuple, got: {type(embedding)}")
+                    raise ValueError(f"Invalid embedding type: {type(embedding)}")
+                    
+                if len(embedding) != Config.EMBEDDING_DIM:
+                    logger.error(f"Invalid dimension: {len(embedding)} (expected {Config.EMBEDDING_DIM})")
+                    raise ValueError(f"Invalid dimension: {len(embedding)}")
+                
+                if is_zero_vector(embedding):
+                    logger.error("Zero vector generated")
+                    raise ValueError("Zero vector generated")
+                
+                logger.debug("Embedding successfully generated and validated")
+                return embedding
+                    
             except Exception as e:
                 logger.error(f"Unexpected error on attempt {attempt+1}: {e}")
                 if attempt < max_retries - 1:
