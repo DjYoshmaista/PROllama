@@ -51,10 +51,46 @@ logger.info("📦 IMPORTING MODULES WITH TRACKING:")
 
 try:
     logger.info("   Importing file_processor...")
-    from document_processor import file_processor
-    logger.info(f"   ✅ file_processor imported, id: {id(file_processor)}")
+    from document_processor import file_processor, file_tracker, document_parser
+    logger.info(f"   ✅ file_processor imported, id: {id(file_processor)}\n  ✅ file_tracker improted, id: {id(file_tracker)}\n  ✅ document_parser imported, id: {id(document_parser)}")
 except Exception as file_processor_import_error:
     logger.error(f"   ❌ file_processor import failed: {file_processor_import_error}")
+    logger.error(f"   📋 Traceback: {traceback.format_exc()}")
+    raise
+
+try:
+    logger.info("   Importing search_engine...")
+    from search_engine import search_engine
+    logger.info(f"   ✅ search_engine imported, id: {id(search_engine)}")
+except Exception as search_engine_import_error:
+    logger.error(f"   ❌ search_engine import failed: {search_engine_import_error}")
+    logger.error(f"   📋 Traceback: {traceback.format_exc()}")
+    raise
+
+# try:
+#     logger.info("   Importing answer_generator...")
+#     from answer_generator import answer_generator
+#     logger.info(f"   ✅ answer_generator imported, id: {id(answer_generator)}")
+# except Exception as answer_generator_import_error:
+#     logger.error(f"   ❌ answer_generator import failed: {answer_generator_import_error}")
+#     logger.error(f"   📋 Traceback: {traceback.format_exc()}")
+#     raise
+
+try:
+    logger.info("   Importing embedding_service...")
+    from embedding_manager import embedding_service
+    logger.info(f"   ✅ embedding_service imported, id: {id(embedding_service)}")
+except Exception as embedding_service_import_error:
+    logger.error(f"   ❌ embedding_service import failed: {embedding_service_import_error}")
+    logger.error(f"   📋 Traceback: {traceback.format_exc()}")
+    raise
+
+try:
+    logger.info("   Improting embedding_queue...")
+    from embedding_manager import embedding_queue
+    logger.info(f"   ✅ embedding_queue imported, id: {id(embedding_queue)}")
+except Exception as embedding_queue_import_error:
+    logger.error(f"   ❌ embedding_queue import failed: {embedding_queue_import_error}")
     logger.error(f"   📋 Traceback: {traceback.format_exc()}")
     raise
 
