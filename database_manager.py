@@ -932,80 +932,223 @@ class DatabaseManager:
             raise Exception(f"Database initialization failed: {e}")
     
     def get_stats(self) -> Dict[str, Any]:
-        """Get comprehensive database statistics"""
+        """
+        Get comprehensive database statistics with enhanced error handling
+        
+        Returns:
+            Dict containing database statistics and metadata
+            
+        Raises:
+            DatabaseConnectionError: If database connection fails
+            DatabaseQueryError: If statistics query fails
+        """
+        logger.info("📊 get_stats() called - Retrieving database statistics")
+        
         try:
             with self.get_sync_cursor() as (conn, cur):
-                table_name = config.TABLE_NAME
-                stats = {}
+                logger.info("   📊 STEP 1: Database connection established")
                 
-                # Check if table exists
-                cur.execute("""
-                    SELECT EXISTS (
-                        SELECT FROM information_schema.tables 
-                        WHERE table_name = %s
-                    )
-                """, (table_name,))
+                # Initialize stats dictionary with safe defaults
+                stats = {
+                    'table_exists': False,
+                    'total_records': 0,
+                    'total_files': 0,
+                    'embedding_coverage': 0.0,
+                    'latest_update': None,
+                    'database_size': '0 bytes',
+                    'index_count': 0,
+                    'connection_status': 'connected',
+                    'database_version': 'Unknown',
+                    'table_name': config.TABLE_NAME
+                }
                 
-                table_exists = cur.fetchone()[0]
-                stats['table_exists'] = table_exists
+                logger.info("   📊 STEP 2: Checking table existence")
+                try:
+                    # Check if table exists - FIXED: proper RealDictCursor result handling
+                    cur.execute("""
+                        SELECT EXISTS (
+                            SELECT 1 FROM information_schema.tables 
+                            WHERE table_name = %s AND table_schema = 'public'
+                        ) as table_exists
+                    """, (config.TABLE_NAME,))
+                    
+                    result = cur.fetchone()
+                    logger.debug(f"      🔍 Table existence query result: {result} (type: {type(result)})")
+                    
+                    # Handle RealDictCursor result properly
+                    if result:
+                        # Access by column name for RealDictCursor
+                        table_exists = result['table_exists']
+                        logger.debug(f"      🔍 Table exists extracted: {table_exists}")
+                    else:
+                        logger.warning("      ⚠️ No result from table existence query")
+                        table_exists = False
+                    
+                    stats['table_exists'] = bool(table_exists)
+                    logger.info(f"      ✅ Table {config.TABLE_NAME} exists: {stats['table_exists']}")
+                    
+                except Exception as table_check_error:
+                    logger.error(f"      ❌ Table existence check failed: {table_check_error}")
+                    logger.debug(f"      📋 Table check traceback: {traceback.format_exc()}")
+                    stats['table_exists'] = False
                 
-                if not table_exists:
-                    stats['record_count'] = 0
-                    stats['table_size'] = '0 bytes'
+                # Only proceed with further stats if table exists
+                if not stats['table_exists']:
+                    logger.warning(f"   ⚠️ Table {config.TABLE_NAME} does not exist, returning basic stats")
                     return stats
                 
-                # Get record count
-                cur.execute(f"SELECT COUNT(*) FROM {table_name}")
-                stats['record_count'] = cur.fetchone()[0]
+                logger.info("   📊 STEP 3: Getting record counts")
+                try:
+                    # Get total record count
+                    cur.execute(f"SELECT COUNT(*) as total_count FROM {config.TABLE_NAME}")
+                    result = cur.fetchone()
+                    
+                    if result:
+                        stats['total_records'] = int(result['total_count'])
+                        logger.info(f"      ✅ Total records: {stats['total_records']:,}")
+                    else:
+                        logger.warning("      ⚠️ No result from record count query")
+                    
+                except Exception as count_error:
+                    logger.error(f"      ❌ Record count failed: {count_error}")
+                    logger.debug(f"      📋 Count error traceback: {traceback.format_exc()}")
                 
-                # Get table size
-                cur.execute(f"""
-                    SELECT pg_size_pretty(pg_total_relation_size('{table_name}')) as size,
-                           pg_total_relation_size('{table_name}') as size_bytes
-                """)
-                size_result = cur.fetchone()
-                stats['table_size'] = size_result[0]
-                stats['table_size_bytes'] = size_result[1]
+                logger.info("   📊 STEP 4: Getting file statistics")
+                try:
+                    # Get unique file count
+                    cur.execute(f"""
+                        SELECT COUNT(DISTINCT file_path) as file_count 
+                        FROM {config.TABLE_NAME} 
+                        WHERE file_path IS NOT NULL
+                    """)
+                    result = cur.fetchone()
+                    
+                    if result:
+                        stats['total_files'] = int(result['file_count'])
+                        logger.info(f"      ✅ Total files: {stats['total_files']:,}")
+                    
+                except Exception as file_count_error:
+                    logger.error(f"      ❌ File count failed: {file_count_error}")
+                    logger.debug(f"      📋 File count error traceback: {traceback.format_exc()}")
                 
-                # Get index information
-                cur.execute(f"""
-                    SELECT indexname, pg_size_pretty(pg_relation_size(indexname::regclass)) as size
-                    FROM pg_indexes 
-                    WHERE tablename = '{table_name}'
-                """)
-                stats['indexes'] = [{'name': row[0], 'size': row[1]} for row in cur.fetchall()]
+                logger.info("   📊 STEP 5: Getting embedding statistics")
+                try:
+                    # Get embedding coverage
+                    if stats['total_records'] > 0:
+                        cur.execute(f"""
+                            SELECT COUNT(*) as embedded_count 
+                            FROM {config.TABLE_NAME} 
+                            WHERE embedding IS NOT NULL
+                        """)
+                        result = cur.fetchone()
+                        
+                        if result:
+                            embedded_count = int(result['embedded_count'])
+                            stats['embedding_coverage'] = (embedded_count / stats['total_records']) * 100
+                            logger.info(f"      ✅ Embedding coverage: {stats['embedding_coverage']:.1f}%")
+                    
+                except Exception as embedding_error:
+                    logger.error(f"      ❌ Embedding statistics failed: {embedding_error}")
+                    logger.debug(f"      📋 Embedding error traceback: {traceback.format_exc()}")
                 
-                # Get column statistics
-                cur.execute(f"""
-                    SELECT 
-                        COUNT(*) FILTER (WHERE embedding IS NOT NULL) as embeddings_count,
-                        COUNT(*) FILTER (WHERE tags IS NOT NULL AND array_length(tags, 1) > 0) as tagged_count,
-                        COUNT(*) FILTER (WHERE file_path IS NOT NULL) as files_with_path,
-                        AVG(LENGTH(content)) as avg_content_length
-                    FROM {table_name}
-                """)
-                column_stats = cur.fetchone()
-                stats.update({
-                    'embeddings_count': column_stats[0] or 0,
-                    'tagged_records': column_stats[1] or 0,
-                    'files_with_path': column_stats[2] or 0,
-                    'avg_content_length': float(column_stats[3] or 0)
-                })
+                logger.info("   📊 STEP 6: Getting latest update timestamp")
+                try:
+                    # Get latest update
+                    cur.execute(f"""
+                        SELECT MAX(created_at) as latest_update 
+                        FROM {config.TABLE_NAME}
+                    """)
+                    result = cur.fetchone()
+                    
+                    if result and result['latest_update']:
+                        stats['latest_update'] = result['latest_update'].isoformat()
+                        logger.info(f"      ✅ Latest update: {stats['latest_update']}")
+                    
+                except Exception as update_error:
+                    logger.error(f"      ❌ Latest update query failed: {update_error}")
+                    logger.debug(f"      📋 Update error traceback: {traceback.format_exc()}")
                 
-                # Get recent activity
-                cur.execute(f"""
-                    SELECT COUNT(*) as recent_count
-                    FROM {table_name}
-                    WHERE created_at > NOW() - INTERVAL '24 hours'
-                """)
-                stats['recent_24h'] = cur.fetchone()[0] or 0
+                logger.info("   📊 STEP 7: Getting database metadata")
+                try:
+                    # Get database version
+                    cur.execute("SELECT version() as db_version")
+                    result = cur.fetchone()
+                    
+                    if result:
+                        version_string = result['db_version']
+                        # Extract just the PostgreSQL version number
+                        import re
+                        version_match = re.search(r'PostgreSQL (\d+\.\d+)', version_string)
+                        if version_match:
+                            stats['database_version'] = f"PostgreSQL {version_match.group(1)}"
+                        else:
+                            stats['database_version'] = version_string[:50]  # Truncate if too long
+                        
+                        logger.info(f"      ✅ Database version: {stats['database_version']}")
+                    
+                except Exception as version_error:
+                    logger.error(f"      ❌ Database version query failed: {version_error}")
+                    logger.debug(f"      📋 Version error traceback: {traceback.format_exc()}")
                 
-                stats['table_name'] = table_name
+                logger.info("   📊 STEP 8: Getting index information")
+                try:
+                    # Get index count for the table
+                    cur.execute("""
+                        SELECT COUNT(*) as index_count
+                        FROM pg_indexes 
+                        WHERE tablename = %s AND schemaname = 'public'
+                    """, (config.TABLE_NAME,))
+                    result = cur.fetchone()
+                    
+                    if result:
+                        stats['index_count'] = int(result['index_count'])
+                        logger.info(f"      ✅ Index count: {stats['index_count']}")
+                    
+                except Exception as index_error:
+                    logger.error(f"      ❌ Index count query failed: {index_error}")
+                    logger.debug(f"      📋 Index error traceback: {traceback.format_exc()}")
+                
+                logger.info("   📊 STEP 9: Getting database size")
+                try:
+                    # Get database size
+                    cur.execute("SELECT pg_size_pretty(pg_database_size(current_database())) as db_size")
+                    result = cur.fetchone()
+                    
+                    if result:
+                        stats['database_size'] = result['db_size']
+                        logger.info(f"      ✅ Database size: {stats['database_size']}")
+                    
+                except Exception as size_error:
+                    logger.error(f"      ❌ Database size query failed: {size_error}")
+                    logger.debug(f"      📋 Size error traceback: {traceback.format_exc()}")
+                
+                logger.info("   📊 STEP 10: Finalizing statistics")
+                logger.info(f"   🎉 Statistics collection completed successfully")
+                logger.debug(f"      📋 Final stats: {stats}")
+                
                 return stats
                 
         except Exception as e:
-            logger.error(f"Error getting database stats: {e}")
-            return {"error": str(e)}
+            logger.error(f"❌ get_stats() failed with error: {e}")
+            logger.debug(f"📋 Full get_stats traceback: {traceback.format_exc()}")
+            
+            # Return safe default stats on error
+            error_stats = {
+                'table_exists': False,
+                'total_records': 0,
+                'total_files': 0,
+                'embedding_coverage': 0.0,
+                'latest_update': None,
+                'database_size': 'Unknown',
+                'index_count': 0,
+                'connection_status': 'error',
+                'database_version': 'Unknown',
+                'table_name': config.TABLE_NAME,
+                'error': str(e)
+            }
+            
+            logger.warning(f"   ⚠️ Returning error stats due to failure: {error_stats}")
+            return error_stats
     
     async def insert_records_batch(self, records: List[Dict[str, Any]]) -> int:
         """Insert multiple records efficiently using async connection"""

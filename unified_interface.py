@@ -6,7 +6,8 @@ import sys
 import time
 import multiprocessing
 import traceback
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
+from pathlib import Path
 
 # CRITICAL: Enable all logging immediately
 logging.basicConfig(
@@ -572,102 +573,259 @@ class UnifiedInterface:
             logger.error(f"Manual document addition failed: {e}")
             print(f"❌ Failed to add document: {e}")
     
-    async def _process_single_file(self):
-        """Process a single file"""
-        print("\n📄 PROCESS SINGLE FILE")
-        print("="*40)
+    def _process_single_file(self, file_path: Path) -> Dict[str, Any]:
+        """
+        Process a single file and return detailed results including record IDs
+        
+        Args:
+            file_path: Path to file to process
+            
+        Returns:
+            Dictionary with processing results and record IDs for embedding
+        """
+        logger.info(f"🔧 process_file() called for: {file_path}")
         
         try:
-            file_path = input("Enter file path: ").strip()
-            if not file_path:
-                print("File path cannot be empty!")
-                return
+            # Track record IDs for embedding queue
+            created_record_ids = []
             
-            file_path = os.path.expanduser(file_path)
+            # Check if file was already processed
+            if self.is_file_processed(file_path):
+                logger.debug(f"   ⏭️ File already processed: {file_path}")
+                return {
+                    'success': True,
+                    'already_processed': True,
+                    'records_created': 0,
+                    'record_ids': [],
+                    'message': 'File already processed'
+                }
             
-            if not os.path.exists(file_path):
-                print(f"❌ File not found: {file_path}")
-                return
+            # Parse the file
+            parsed_result = self.parser.parse_file(file_path)
             
-            if not os.path.isfile(file_path):
-                print(f"❌ Path is not a file: {file_path}")
-                return
+            if not parsed_result or not parsed_result.get('success'):
+                logger.warning(f"   ⚠️ Failed to parse file: {file_path}")
+                return {
+                    'success': False,
+                    'records_created': 0,
+                    'record_ids': [],
+                    'message': 'File parsing failed'
+                }
             
-            print(f"Processing file: {file_path}")
-            tracker = ProgressTracker(f"Processing {os.path.basename(file_path)}")
+            documents = parsed_result.get('documents', [])
+            if not documents:
+                logger.warning(f"   ⚠️ No documents extracted from: {file_path}")
+                return {
+                    'success': False,
+                    'records_created': 0,
+                    'record_ids': [],
+                    'message': 'No documents extracted'
+                }
             
-            # Process the file
-            result = await file_processor.process_file(file_path, tracker.update_file_progress)
-            file_path, success, records_count, processing_time = result
+            # Store documents in database
+            records_created = 0
             
-            if success:
-                tracker.complete(records_count)
-                print(f"✅ File processed successfully!")
-                print(f"   Records created: {records_count}")
-                print(f"   Processing time: {processing_time:.2f}s")
-            else:
-                print(f"❌ File processing failed.")
+            with db_manager.get_sync_cursor() as (conn, cur):
+                for i, doc in enumerate(documents):
+                    try:
+                        # Insert document record
+                        insert_query = f"""
+                            INSERT INTO {config.TABLE_NAME} 
+                            (content, file_path, chunk_index, metadata, tags)
+                            VALUES (%s, %s, %s, %s, %s)
+                            RETURNING id
+                        """
+                        
+                        # Prepare metadata
+                        metadata = {
+                            'file_size': file_path.stat().st_size,
+                            'file_type': file_path.suffix.lower(),
+                            'processing_timestamp': time.time(),
+                            'chunk_count': len(documents),
+                            **doc.get('metadata', {})
+                        }
+                        
+                        # Execute insert
+                        cur.execute(insert_query, (
+                            doc['content'],
+                            str(file_path),
+                            i,
+                            json.dumps(metadata),
+                            doc.get('tags', [])
+                        ))
+                        
+                        # Get the inserted record ID
+                        result = cur.fetchone()
+                        if result:
+                            record_id = result['id']  # Handle RealDictCursor result
+                            created_record_ids.append(record_id)
+                            records_created += 1
+                            
+                            logger.debug(f"   📝 Created record {record_id} for chunk {i}")
+                        
+                    except Exception as insert_error:
+                        logger.error(f"   ❌ Error inserting document {i}: {insert_error}")
+                        continue
                 
+                # Commit all inserts
+                conn.commit()
+            
+            # Mark file as processed
+            self.mark_file_processed(file_path, records_created)
+            
+            logger.info(f"   ✅ Successfully processed {file_path}: {records_created} records")
+            
+            return {
+                'success': True,
+                'records_created': records_created,
+                'record_ids': created_record_ids,
+                'file_path': str(file_path),
+                'message': f'Successfully created {records_created} records'
+            }
+            
         except Exception as e:
-            logger.error(f"Single file processing failed: {e}")
-            print(f"❌ Error processing file: {e}")
+            logger.error(f"❌ process_file() failed for {file_path}: {e}")
+            logger.debug(f"📋 Process file traceback: {traceback.format_exc()}")
+            
+            return {
+                'success': False,
+                'records_created': 0,
+                'record_ids': [],
+                'file_path': str(file_path),
+                'message': f'Processing failed: {str(e)}'
+            }
     
-    async def _process_folder(self):
-        """Process an entire folder"""
-        print("\n📁 PROCESS FOLDER")
-        print("="*40)
+    async def _process_folder(self, folder_path: str, file_patterns: List[str] = None) -> Dict[str, Any]:
+        """
+        Process folder with concurrent file processing and embedding generation
+        
+        Args:
+            folder_path: Path to folder to process
+            file_patterns: Optional list of file patterns to match
+            
+        Returns:
+            Dictionary with processing results
+        """
+        logger.info(f"🚀 process_folder() called - Enhanced concurrent processing")
+        logger.info(f"   📁 Folder: {folder_path}")
+        logger.info(f"   🔍 Patterns: {file_patterns or ['*']}")
         
         try:
-            folder_path = file_processor.get_file_browser_path()
-            if not folder_path:
-                print("No folder selected.")
-                return
+            # Import concurrent processor
+            from async_processor import concurrent_processor
             
-            print(f"Analyzing folder: {folder_path}")
+            # Find files to process
+            folder = Path(folder_path)
+            if not folder.exists():
+                raise FileNotFoundError(f"Folder does not exist: {folder_path}")
             
-            # Discover files
-            files_to_process, filter_stats = file_processor.discover_files(folder_path)
+            # Collect files based on patterns
+            file_paths = []
+            patterns = file_patterns or ['*']
             
-            print(f"\n📊 Discovery Results:")
-            print(f"   Total files found: {filter_stats.total_files}")
-            print(f"   Files needing processing: {filter_stats.files_to_process}")
-            print(f"   Files already processed: {filter_stats.already_processed}")
-            print(f"   New files: {filter_stats.new_files}")
-            print(f"   Changed files: {filter_stats.size_changed + filter_stats.time_changed + filter_stats.content_changed}")
+            for pattern in patterns:
+                if '*' in pattern or '?' in pattern:
+                    # Glob pattern
+                    file_paths.extend(folder.rglob(pattern))
+                else:
+                    # Extension pattern
+                    file_paths.extend(folder.rglob(f"*.{pattern.lstrip('.')}"))
             
-            if not files_to_process:
-                print("✅ All files are already processed!")
-                return
+            # Remove duplicates and ensure they're files
+            file_paths = list(set([p for p in file_paths if p.is_file()]))
             
-            # Confirm processing
-            confirm = input(f"\nProcess {len(files_to_process)} files? (y/n): ").strip().lower()
-            if confirm != 'y':
-                print("Processing cancelled.")
-                return
+            logger.info(f"   📊 Found {len(file_paths)} files to process")
             
-            print(f"\n🚀 Starting enhanced processing pipeline...")
+            if not file_paths:
+                logger.warning("   ⚠️ No files found matching patterns")
+                return {
+                    'success': False,
+                    'message': 'No files found matching the specified patterns',
+                    'files_processed': 0,
+                    'files_failed': 0,
+                    'records_created': 0,
+                    'embeddings_generated': 0
+                }
             
-            # Create progress tracker
-            progress_tracker = ProgressTracker("Enhanced Processing")
+            # Setup progress tracking
+            progress_data = {
+                'total_files': len(file_paths),
+                'processed_files': 0,
+                'failed_files': 0,
+                'current_file': None,
+                'records_created': 0,
+                'embeddings_generated': 0,
+                'embeddings_pending': 0,
+                'start_time': time.time()
+            }
             
-            # Process files
-            success_count = await async_processor.process_files_enhanced(
-                files_to_process,
-                progress_tracker
+            def progress_callback(update_data: Dict[str, Any]):
+                """Update progress tracking"""
+                progress_data.update(update_data)
+                
+                # Calculate progress percentage
+                progress_pct = (progress_data['processed_files'] / progress_data['total_files']) * 100
+                elapsed = time.time() - progress_data['start_time']
+                
+                # Calculate rates
+                file_rate = progress_data['processed_files'] / elapsed if elapsed > 0 else 0
+                
+                # Print progress update
+                print(f"\r📊 Progress: {progress_pct:.1f}% | "
+                    f"Files: {progress_data['processed_files']}/{progress_data['total_files']} "
+                    f"({file_rate:.1f}/s) | "
+                    f"Records: {progress_data['records_created']} | "
+                    f"Embeddings: {progress_data['embeddings_generated']} | "
+                    f"Pending: {progress_data['embeddings_pending']}", end='')
+            
+            # Start concurrent processing
+            logger.info("   🚀 Starting concurrent file processing with embedding generation...")
+            
+            results = await concurrent_processor.process_files_concurrent(
+                file_paths=file_paths,
+                progress_callback=progress_callback
             )
             
-            print(f"\n✅ Folder processing complete!")
-            print(f"   Files processed: {success_count}/{len(files_to_process)}")
+            # Print final newline for clean output
+            print()
             
-            # Show final statistics
-            status = async_processor.get_processing_status()
-            current_stats = status['current_stats']
-            print(f"   Total records created: {current_stats['total_records']}")
-            print(f"   Processing time: {current_stats['processing_time']:.2f}s")
+            # Prepare final results
+            total_time = results.get('total_time', 0)
+            final_results = {
+                'success': True,
+                'message': f'Successfully processed {results["files_processed"]} files with concurrent embedding generation',
+                'files_processed': results['files_processed'],
+                'files_failed': results['files_failed'],
+                'records_created': results['records_created'],
+                'embeddings_generated': results['embeddings_generated'],
+                'embeddings_pending': results['embeddings_pending'],
+                'total_time': total_time,
+                'file_processing_rate': results.get('file_rate', 0),
+                'embedding_generation_rate': results.get('embedding_rate', 0),
+                'success_rate': results.get('success_rate', 0)
+            }
+            
+            logger.info(f"🎉 Concurrent folder processing completed:")
+            logger.info(f"   📁 Files processed: {final_results['files_processed']}")
+            logger.info(f"   📊 Records created: {final_results['records_created']}")
+            logger.info(f"   🔧 Embeddings generated: {final_results['embeddings_generated']}")
+            logger.info(f"   ⏱️ Total time: {total_time:.2f}s")
+            logger.info(f"   📈 File rate: {final_results['file_processing_rate']:.2f}/s")
+            logger.info(f"   📈 Embedding rate: {final_results['embedding_generation_rate']:.2f}/s")
+            
+            return final_results
             
         except Exception as e:
-            logger.error(f"Folder processing failed: {e}")
-            print(f"❌ Error processing folder: {e}")
+            logger.error(f"❌ process_folder() failed: {e}")
+            logger.debug(f"📋 Process folder traceback: {traceback.format_exc()}")
+            return {
+                'success': False,
+                'message': f'Folder processing failed: {str(e)}',
+                'files_processed': 0,
+                'files_failed': 0,
+                'records_created': 0,
+                'embeddings_generated': 0
+            }
     
     async def _search_documents(self):
         """Search documents with various methods"""

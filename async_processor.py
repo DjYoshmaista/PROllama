@@ -14,8 +14,422 @@ from document_processor import file_processor, file_tracker
 from embedding_manager import embedding_queue
 from tqdm import tqdm
 import gc
+import asyncio
+import logging
+import time
+from typing import Dict, List, Optional, Any, Tuple
+from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
+from queue import Queue, Empty
+import multiprocessing as mp
+from dataclasses import dataclass
+
+# Add these imports at the top
+from embedding_manager import EmbeddingQueue, EmbeddingService
 
 logger = logging.getLogger(__name__)
+
+@dataclass
+class ProcessingStatus:
+    """Track processing status across all concurrent operations"""
+    files_processed: int = 0
+    files_failed: int = 0
+    records_created: int = 0
+    embeddings_generated: int = 0
+    embeddings_pending: int = 0
+    start_time: float = 0.0
+    last_update: float = 0.0
+
+class ConcurrentProcessor:
+    """
+    Enhanced processor that runs file processing and embedding generation concurrently
+    """
+    
+    def __init__(self, max_workers: Optional[int] = None):
+        """
+        Initialize concurrent processor
+        
+        Args:
+            max_workers: Maximum number of worker threads for file processing
+        """
+        logger.info("🚀 ConcurrentProcessor.__init__() called")
+        
+        # Initialize core components
+        self.max_workers = max_workers or min(8, (mp.cpu_count() or 1) + 4)
+        self.status = ProcessingStatus()
+        self._shutdown_event = threading.Event()
+        self._processing_active = False
+        
+        # Initialize embedding components
+        self.embedding_queue = EmbeddingQueue()
+        self.embedding_service = EmbeddingService()
+        
+        # Initialize tracking
+        self._embedding_task = None
+        self._monitoring_task = None
+        
+        logger.info(f"   ✅ Concurrent processor initialized with {self.max_workers} workers")
+        logger.info(f"   📊 Embedding queue size: {self.embedding_queue._stats['queue_size']}")
+    
+    async def start_background_services(self):
+        """Start all background services for concurrent processing"""
+        logger.info("🚀 start_background_services() called")
+        
+        try:
+            # Start embedding service if not already running
+            if not self._embedding_task or self._embedding_task.done():
+                logger.info("   🔄 Starting embedding service task...")
+                self._embedding_task = asyncio.create_task(
+                    self._run_embedding_service(),
+                    name="embedding_service"
+                )
+                logger.info("   ✅ Embedding service task started")
+            
+            # Start monitoring task if not already running
+            if not self._monitoring_task or self._monitoring_task.done():
+                logger.info("   🔄 Starting monitoring task...")
+                self._monitoring_task = asyncio.create_task(
+                    self._run_monitoring(),
+                    name="processing_monitor"
+                )
+                logger.info("   ✅ Monitoring task started")
+            
+            # Give tasks a moment to initialize
+            await asyncio.sleep(0.1)
+            
+            logger.info("   🎉 All background services started successfully")
+            
+        except Exception as e:
+            logger.error(f"   ❌ Failed to start background services: {e}")
+            logger.debug(f"   📋 Background service start traceback: {traceback.format_exc()}")
+            raise
+    
+    async def _run_embedding_service(self):
+        """Run the embedding service continuously in the background"""
+        logger.info("🔧 _run_embedding_service() started")
+        
+        try:
+            consecutive_empty = 0
+            max_consecutive_empty = 30  # 30 seconds of empty queue before longer sleep
+            
+            while not self._shutdown_event.is_set():
+                try:
+                    # Process embeddings from queue
+                    processed_count = await self.embedding_service.process_pending_embeddings(
+                        batch_size=50,  # Process in smaller batches for responsiveness
+                        max_time=5.0    # Process for max 5 seconds at a time
+                    )
+                    
+                    if processed_count > 0:
+                        self.status.embeddings_generated += processed_count
+                        consecutive_empty = 0
+                        logger.debug(f"   🔧 Processed {processed_count} embeddings")
+                    else:
+                        consecutive_empty += 1
+                    
+                    # Update pending count
+                    self.status.embeddings_pending = self.embedding_queue.size()
+                    
+                    # Adaptive sleep based on queue activity
+                    if consecutive_empty >= max_consecutive_empty:
+                        # Longer sleep when queue has been empty for a while
+                        await asyncio.sleep(2.0)
+                    elif consecutive_empty >= 10:
+                        # Medium sleep when queue has been empty for some time
+                        await asyncio.sleep(0.5)
+                    else:
+                        # Short sleep when actively processing
+                        await asyncio.sleep(0.1)
+                        
+                except asyncio.CancelledError:
+                    logger.info("   🔄 Embedding service cancelled")
+                    break
+                except Exception as e:
+                    logger.error(f"   ❌ Embedding service error: {e}")
+                    logger.debug(f"   📋 Embedding service traceback: {traceback.format_exc()}")
+                    await asyncio.sleep(1.0)  # Wait before retrying
+            
+            logger.info("🔧 _run_embedding_service() completed")
+            
+        except Exception as e:
+            logger.error(f"❌ _run_embedding_service() failed: {e}")
+            logger.debug(f"📋 Embedding service full traceback: {traceback.format_exc()}")
+    
+    async def _run_monitoring(self):
+        """Run monitoring and progress updates"""
+        logger.info("📊 _run_monitoring() started")
+        
+        try:
+            last_files = 0
+            last_embeddings = 0
+            last_time = time.time()
+            
+            while not self._shutdown_event.is_set():
+                try:
+                    current_time = time.time()
+                    time_delta = current_time - last_time
+                    
+                    if time_delta >= 5.0:  # Update every 5 seconds
+                        # Calculate rates
+                        files_delta = self.status.files_processed - last_files
+                        embeddings_delta = self.status.embeddings_generated - last_embeddings
+                        
+                        file_rate = files_delta / time_delta if time_delta > 0 else 0
+                        embedding_rate = embeddings_delta / time_delta if time_delta > 0 else 0
+                        
+                        # Log progress
+                        logger.info(
+                            f"📊 Processing Status: "
+                            f"Files: {self.status.files_processed} "
+                            f"({file_rate:.1f}/s) | "
+                            f"Records: {self.status.records_created} | "
+                            f"Embeddings: {self.status.embeddings_generated} "
+                            f"({embedding_rate:.1f}/s) | "
+                            f"Pending: {self.status.embeddings_pending}"
+                        )
+                        
+                        # Update tracking variables
+                        last_files = self.status.files_processed
+                        last_embeddings = self.status.embeddings_generated
+                        last_time = current_time
+                        self.status.last_update = current_time
+                    
+                    await asyncio.sleep(1.0)
+                    
+                except asyncio.CancelledError:
+                    logger.info("   🔄 Monitoring cancelled")
+                    break
+                except Exception as e:
+                    logger.error(f"   ❌ Monitoring error: {e}")
+                    await asyncio.sleep(1.0)
+            
+            logger.info("📊 _run_monitoring() completed")
+            
+        except Exception as e:
+            logger.error(f"❌ _run_monitoring() failed: {e}")
+            logger.debug(f"📋 Monitoring full traceback: {traceback.format_exc()}")
+    
+    async def process_files_concurrent(
+        self, 
+        file_paths: List[Path], 
+        progress_callback: Optional[callable] = None
+    ) -> Dict[str, Any]:
+        """
+        Process files with concurrent embedding generation
+        
+        Args:
+            file_paths: List of file paths to process
+            progress_callback: Optional callback for progress updates
+            
+        Returns:
+            Dictionary with processing results and statistics
+        """
+        logger.info(f"🚀 process_files_concurrent() called with {len(file_paths)} files")
+        
+        # Initialize status
+        self.status = ProcessingStatus()
+        self.status.start_time = time.time()
+        self._processing_active = True
+        
+        try:
+            # Start background services
+            await self.start_background_services()
+            
+            # Process files using thread pool
+            results = await self._process_files_threaded(file_paths, progress_callback)
+            
+            # Wait for remaining embeddings to complete
+            await self._finalize_embeddings()
+            
+            # Calculate final statistics
+            total_time = time.time() - self.status.start_time
+            
+            final_results = {
+                'files_processed': self.status.files_processed,
+                'files_failed': self.status.files_failed,
+                'records_created': self.status.records_created,
+                'embeddings_generated': self.status.embeddings_generated,
+                'embeddings_pending': self.status.embeddings_pending,
+                'total_time': total_time,
+                'file_rate': self.status.files_processed / total_time if total_time > 0 else 0,
+                'embedding_rate': self.status.embeddings_generated / total_time if total_time > 0 else 0,
+                'success_rate': (self.status.files_processed / len(file_paths)) * 100 if file_paths else 0
+            }
+            
+            logger.info(f"🎉 Concurrent processing completed: {final_results}")
+            return final_results
+            
+        except Exception as e:
+            logger.error(f"❌ process_files_concurrent() failed: {e}")
+            logger.debug(f"📋 Concurrent processing traceback: {traceback.format_exc()}")
+            raise
+        finally:
+            self._processing_active = False
+            await self._shutdown_services()
+    
+    async def _process_files_threaded(
+        self, 
+        file_paths: List[Path], 
+        progress_callback: Optional[callable] = None
+    ) -> Dict[str, Any]:
+        """Process files using thread pool while embeddings run concurrently"""
+        logger.info(f"🔧 _process_files_threaded() called with {len(file_paths)} files")
+        
+        # Import here to avoid circular imports
+        from document_processor import DocumentProcessor
+        
+        processor = DocumentProcessor()
+        loop = asyncio.get_event_loop()
+        
+        # Create thread pool executor
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            # Submit all file processing tasks
+            future_to_file = {
+                loop.run_in_executor(
+                    executor, 
+                    self._process_single_file, 
+                    processor, 
+                    file_path
+                ): file_path for file_path in file_paths
+            }
+            
+            # Process completed tasks as they finish
+            for future in asyncio.as_completed(future_to_file):
+                try:
+                    file_path = future_to_file[future]
+                    result = await future
+                    
+                    if result['success']:
+                        self.status.files_processed += 1
+                        self.status.records_created += result['records_created']
+                        
+                        # Add records to embedding queue immediately
+                        if result['record_ids']:
+                            await self._queue_embeddings(result['record_ids'])
+                    else:
+                        self.status.files_failed += 1
+                        logger.warning(f"   ⚠️ Failed to process: {file_path}")
+                    
+                    # Call progress callback if provided
+                    if progress_callback:
+                        try:
+                            progress_callback({
+                                'processed': self.status.files_processed,
+                                'failed': self.status.files_failed,
+                                'total': len(file_paths),
+                                'current_file': file_path,
+                                'records_created': self.status.records_created,
+                                'embeddings_generated': self.status.embeddings_generated,
+                                'embeddings_pending': self.status.embeddings_pending
+                            })
+                        except Exception as callback_error:
+                            logger.warning(f"   ⚠️ Progress callback error: {callback_error}")
+                    
+                    # Brief pause to allow embedding service to work
+                    await asyncio.sleep(0.01)
+                    
+                except Exception as e:
+                    file_path = future_to_file[future]
+                    self.status.files_failed += 1
+                    logger.error(f"   ❌ Error processing {file_path}: {e}")
+        
+        logger.info(f"🔧 _process_files_threaded() completed")
+        return {
+            'files_processed': self.status.files_processed,
+            'files_failed': self.status.files_failed,
+            'records_created': self.status.records_created
+        }
+    
+    def _process_single_file(self, processor, file_path: Path) -> Dict[str, Any]:
+        """Process a single file and return results"""
+        try:
+            # Process the file
+            result = processor.process_file(file_path)
+            
+            if result and result.get('success'):
+                return {
+                    'success': True,
+                    'records_created': result.get('records_created', 0),
+                    'record_ids': result.get('record_ids', [])
+                }
+            else:
+                return {
+                    'success': False,
+                    'records_created': 0,
+                    'record_ids': []
+                }
+                
+        except Exception as e:
+            logger.error(f"Error in _process_single_file for {file_path}: {e}")
+            return {
+                'success': False,
+                'records_created': 0,
+                'record_ids': []
+            }
+    
+    async def _queue_embeddings(self, record_ids: List[int]):
+        """Queue records for embedding generation"""
+        try:
+            for record_id in record_ids:
+                await self.embedding_queue.add_to_queue(record_id)
+            
+            logger.debug(f"   🔧 Queued {len(record_ids)} records for embedding")
+            
+        except Exception as e:
+            logger.error(f"   ❌ Error queuing embeddings: {e}")
+    
+    async def _finalize_embeddings(self):
+        """Wait for remaining embeddings to complete"""
+        logger.info("🔧 _finalize_embeddings() called")
+        
+        # Wait for embedding queue to be processed
+        max_wait = 300  # 5 minutes max wait
+        wait_time = 0
+        check_interval = 2.0
+        
+        while wait_time < max_wait and self.embedding_queue.size() > 0:
+            pending = self.embedding_queue.size()
+            logger.info(f"   ⏳ Waiting for {pending} embeddings to complete...")
+            
+            await asyncio.sleep(check_interval)
+            wait_time += check_interval
+        
+        if self.embedding_queue.size() > 0:
+            logger.warning(f"   ⚠️ Timeout waiting for embeddings: {self.embedding_queue.size()} still pending")
+        else:
+            logger.info("   ✅ All embeddings completed")
+    
+    async def _shutdown_services(self):
+        """Shutdown all background services"""
+        logger.info("🔧 _shutdown_services() called")
+        
+        try:
+            # Signal shutdown
+            self._shutdown_event.set()
+            
+            # Cancel tasks
+            if self._embedding_task and not self._embedding_task.done():
+                self._embedding_task.cancel()
+                try:
+                    await self._embedding_task
+                except asyncio.CancelledError:
+                    pass
+            
+            if self._monitoring_task and not self._monitoring_task.done():
+                self._monitoring_task.cancel()
+                try:
+                    await self._monitoring_task
+                except asyncio.CancelledError:
+                    pass
+            
+            logger.info("   ✅ All services shutdown completed")
+            
+        except Exception as e:
+            logger.error(f"   ❌ Error during service shutdown: {e}")
+
+# Global concurrent processor instance
+concurrent_processor = ConcurrentProcessor()
 
 @dataclass
 class ProcessingStats:
